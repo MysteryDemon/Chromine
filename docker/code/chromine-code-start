@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+state="$HOME/.chromine"
+mkdir -p "$state"
+
+case "${VS_CODE_DEFAULT_THEME:-dark}" in
+  dark) theme="Default Dark Modern" ;;
+  light) theme="Default Light Modern" ;;
+  *)
+    echo "VS_CODE_DEFAULT_THEME must be dark or light, got ${VS_CODE_DEFAULT_THEME}" >&2
+    exit 1
+    ;;
+esac
+if [ "$(cat "$state/default-theme" 2>/dev/null || true)" != "$theme" ]; then
+  if /usr/lib/code-server/lib/node -e '
+    const fs = require("fs"), path = require("path");
+    const [file, theme] = process.argv.slice(1);
+    let settings = {};
+    try {
+      settings = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (e) {
+      if (e.code !== "ENOENT") {
+        console.error("chromine: " + file + " is not plain JSON, so the default theme was not applied");
+        process.exit(1);
+      }
+    }
+    settings["workbench.colorTheme"] = theme;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n");
+  ' "$HOME/.local/share/code-server/User/settings.json" "$theme"; then
+    printf '%s\n' "$theme" > "$state/default-theme"
+  fi
+fi
+
+if [ -s "$state/apt-packages" ]; then
+  missing=""
+  for p in $(cat "$state/apt-packages"); do
+    [ "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null || true)" = installed ] || missing="$missing $p"
+  done
+  if [ -n "$missing" ]; then
+    echo "chromine: reinstalling packages added before:$missing (log: $state/apt-restore.log)" >&2
+    (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing) \
+      > "$state/apt-restore.log" 2>&1 &
+  fi
+fi
+
+exec dumb-init /usr/bin/code-server "$@"

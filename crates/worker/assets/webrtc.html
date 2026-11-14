@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Chromine</title>
+    <link rel="stylesheet" href="webrtc.css" />
+    <script type="module" src="webrtc.js"></script>
+  </head>
+  <body>
+    <div id="screen" tabindex="-1"><video id="video" autoplay playsinline muted></video></div>
+    <textarea id="keyboard-input" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" tabindex="-1"></textarea>
+    <button id="keyboard" type="button" aria-label="Show keyboard" hidden>
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <rect x="2" y="5" width="20" height="14" rx="2" />
+        <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 15h6" />
+      </svg>
+    </button>
+    <div id="status">Connecting…</div>
+  </body>
+</html>

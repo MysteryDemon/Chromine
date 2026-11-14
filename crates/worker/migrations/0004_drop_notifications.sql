@@ -1,0 +1,11 @@
+UPDATE jobs SET cleanup_state = 'retained' WHERE cleanup_state = 'waiting' AND upload_state IN ('uploaded', 'skipped');
+UPDATE jobs SET upload_error = NULL WHERE upload_state = 'skipped';
+DROP INDEX jobs_notify_queue;
+ALTER TABLE jobs DROP COLUMN notify_state;
+ALTER TABLE jobs DROP COLUMN notify_kind;
+ALTER TABLE jobs DROP COLUMN notify_attempts;
+ALTER TABLE jobs DROP COLUMN notify_next_at;
+ALTER TABLE jobs DROP COLUMN notify_error;
+ALTER TABLE jobs DROP COLUMN telegram_random_id;
+ALTER TABLE jobs DROP COLUMN telegram_message_id;
+ALTER TABLE jobs DROP COLUMN notified_at;

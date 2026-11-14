@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+dir="${CHROMINE_LINKS_DIR:-/code-links}"
+if [ "$#" -eq 0 ]; then
+  echo "usage: chromine-open URL..." >&2
+  exit 2
+fi
+for url in "$@"; do
+  case "$url" in
+    [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) ;;
+    *)
+      echo "chromine-open: only web links can open in the remote browser: $url" >&2
+      exit 1
+      ;;
+  esac
+  tmp="$(mktemp "$dir/.link.XXXXXX")"
+  printf '%s\n' "$url" > "$tmp"
+  chmod 0660 "$tmp"
+  mv "$tmp" "$dir/$(date +%s%N)-$$.url"
+  echo "Opened in the remote browser (Browser tab): $url" >&2
+done

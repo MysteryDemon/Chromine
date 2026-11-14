@@ -1,0 +1,1 @@
+ALTER TABLE jobs ADD COLUMN notify_kind TEXT NOT NULL DEFAULT 'link';
