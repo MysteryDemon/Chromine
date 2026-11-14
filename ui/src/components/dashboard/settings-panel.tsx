@@ -72,7 +72,7 @@ function readOpen(): string[] {
     const saved: unknown = JSON.parse(localStorage.getItem(OPEN_KEY) ?? "null");
     if (Array.isArray(saved)) return saved.filter((s) => SECTIONS.includes(s));
   } catch {}
-  return ["downloads"];
+  return [];
 }
 
 const PILL =
