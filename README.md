@@ -1,4 +1,9 @@
 ```
+for v in chrome-profile downloads state code-home code-usr-local; do docker volume create "chromine_$v"; done
+docker compose up -d
+```
+
+```
 chromine/
 ├── crates/
 │   ├── agent/
