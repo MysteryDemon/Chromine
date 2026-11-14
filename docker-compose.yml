@@ -1,0 +1,155 @@
+name: chromine
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  restart: unless-stopped
+  init: true
+  logging: *logging
+
+services:
+  browser:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/browser/Dockerfile
+    hostname: chromine-browser
+    user: "10001:10000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./docker/browser/seccomp-chrome.json
+    shm_size: ${CHROME_SHM_SIZE:-2gb}
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    environment:
+      DOWNLOAD_DIR: /downloads
+      VNC_SOCKET: /vnc/vnc.sock
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
+      CHROME_SAFE_BROWSING: ${CHROME_SAFE_BROWSING:-off}
+      DEFAULT_THEME: ${DEFAULT_THEME:-dark}
+      SCREEN_WIDTH: ${SCREEN_WIDTH:-1600}
+      SCREEN_HEIGHT: ${SCREEN_HEIGHT:-900}
+      DISPLAY_SCALE: ${DISPLAY_SCALE:-1}
+      TZ: ${TZ:-UTC}
+      LANG: ${BROWSER_LANG:-C.UTF-8}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+    volumes:
+      - chrome-profile:/profile
+      - downloads:/downloads
+      - vnc:/vnc
+      - code-links:/code-links
+    networks: [browser_egress]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/chromine-agent", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 30s
+
+  worker:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    user: "10002:10000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ports:
+      - "${DASHBOARD_BIND:-0.0.0.0}:${DASHBOARD_PORT:-6757}:8000"
+      - "${DASHBOARD_BIND:-0.0.0.0}:${WEBRTC_PORT:-6758}:${WEBRTC_PORT:-6758}/udp"
+      - "${DASHBOARD_BIND:-0.0.0.0}:${CODE_PORT:-6759}:8001"
+      - "${ACME_HTTP_PORT:-80}:8080"
+    environment:
+      APP_AUTH_USER: ${APP_AUTH_USER:?set APP_AUTH_USER in .env}
+      APP_AUTH_PASSWORD: ${APP_AUTH_PASSWORD:?set APP_AUTH_PASSWORD in .env (the dashboard password)}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-}
+      APP_SESSION_TTL_HOURS: ${APP_SESSION_TTL_HOURS:-12}
+      HTTPS_HOST: ${HTTPS_HOST:-auto}
+      DASHBOARD_PORT: ${DASHBOARD_PORT:-6757}
+      DISPLAY_SCALE: ${DISPLAY_SCALE:-1}
+      STREAM_MODE: ${STREAM_MODE:-vnc}
+      WEBRTC_PORT: ${WEBRTC_PORT:-6758}
+      WEBRTC_HOST: ${WEBRTC_HOST:-}
+      WEBRTC_CODEC: ${WEBRTC_CODEC:-auto}
+      DOWNLOAD_DIR: /downloads
+      STATE_DIR: /state
+      VNC_SOCKET: /vnc/vnc.sock
+      CODE_SOCKET: /code-socket/code.sock
+      CODE_LINKS_DIR: /code-links
+      CODE_PORT: ${CODE_PORT:-6759}
+      CODE_PUBLIC_URL: ${CODE_PUBLIC_URL:-}
+      DELETE_AFTER_SUCCESS: ${DELETE_AFTER_SUCCESS:-true}
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
+      FILECLOUD_BASE_URL: ${FILECLOUD_BASE_URL:-https://filecloud24.cc}
+      UPLOAD_REQUEST_TIMEOUT_SECS: ${UPLOAD_REQUEST_TIMEOUT_SECS:-300}
+      MAX_RETRY_ATTEMPTS: ${MAX_RETRY_ATTEMPTS:-8}
+      TZ: ${TZ:-UTC}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+    volumes:
+      - downloads:/downloads
+      - state:/state
+      - vnc:/vnc
+      - code-socket:/code-socket
+      - code-links:/code-links
+    networks: [worker_egress]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/chromine-worker", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 30s
+
+  code:
+    build:
+      context: .
+      dockerfile: docker/code/Dockerfile
+    restart: unless-stopped
+    logging: *logging
+    network_mode: service:browser
+    depends_on: [browser]
+    environment:
+      TZ: ${TZ:-UTC}
+      VS_CODE_DEFAULT_THEME: ${VS_CODE_DEFAULT_THEME:-dark}
+    volumes:
+      - code-home:/root
+      - code-usr-local:/usr/local
+      - code-socket:/code-socket
+      - code-links:/code-links
+    stop_grace_period: 15s
+
+volumes:
+  chrome-profile:
+    name: chromine_chrome-profile
+    external: true
+  downloads:
+    name: chromine_downloads
+    external: true
+  state:
+    name: chromine_state
+    external: true
+  vnc:
+  code-home:
+    name: chromine_code-home
+    external: true
+  code-usr-local:
+    name: chromine_code-usr-local
+    external: true
+  code-socket:
+  code-links:
+
+networks:
+  browser_egress: {}
+  worker_egress: {}
