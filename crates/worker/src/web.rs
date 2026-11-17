@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
 use axum::Router;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -12,6 +11,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use axum::{Extension, Json};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chromine_shared::{AgentStatus, DiskSpace, fsutil, now_ms};
 use futures_util::{SinkExt, StreamExt};
@@ -22,8 +22,8 @@ use tokio::sync::Notify;
 
 use crate::auth::{self, LoginLimiter, SESSION_COOKIE};
 use crate::config::{Config, Secret};
-use crate::db::{Db, Job, NewSession, RetryOutcome, SessionRow, state};
-use crate::ingest::{Ingest, Orphan};
+use crate::db::{Db, Job, NewSession, RetryOutcome, SessionRow, UserRow, state};
+use crate::ingest::Orphan;
 use crate::settings::Live;
 use crate::upload::Uploader;
 
@@ -34,7 +34,7 @@ pub struct AppState {
     pub settings: Arc<crate::settings::Store>,
     pub cfg: Arc<Config>,
     pub db: Db,
-    pub ingest: Ingest,
+    pub spaces: crate::users::Spaces,
     pub uploader: Uploader,
     pub password_hash: Secret,
     pub upload_wake: Arc<Notify>,
@@ -50,6 +50,16 @@ pub(crate) type Shared = Arc<AppState>;
 pub(crate) struct Authed {
     id_hash: String,
     session: SessionRow,
+}
+
+impl Authed {
+    pub(crate) fn owner(&self) -> &str {
+        &self.session.owner
+    }
+
+    pub(crate) fn is_admin(&self) -> bool {
+        self.session.owner.is_empty()
+    }
 }
 
 fn client_ip(peer: SocketAddr) -> IpAddr {
@@ -68,6 +78,9 @@ pub(crate) async fn authenticate(st: &AppState, jar: &CookieJar) -> Option<Authe
     let id_hash = auth::session_hash(&token);
     let now = now_ms();
     let session = st.db.get_session(&id_hash, now).await.ok()??;
+    if session.owner.is_empty() && !auth::ct_eq(&session.username, &st.cfg.auth_user) {
+        return None;
+    }
     if now - session.last_seen_at > 60_000 {
         let _ = st.db.touch_session(&id_hash, now).await;
     }
@@ -85,6 +98,10 @@ fn login_redirect(next: &str) -> Response {
 
 fn api_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
+}
+
+fn admin_only() -> Response {
+    api_error(StatusCode::FORBIDDEN, "only the admin can do this")
 }
 
 async fn require_auth(State(st): State<Shared>, jar: CookieJar, mut req: Request, next: Next) -> Response {
@@ -160,6 +177,10 @@ pub fn router(st: Shared) -> Router {
         .route("/api/orphans/import", post(api_import))
         .route("/api/settings", get(api_settings).post(api_save_settings))
         .route("/api/settings/reset", post(api_reset_settings))
+        .route("/api/users", get(api_users).post(api_create_user))
+        .route("/api/users/{id}/password", post(api_user_password))
+        .route("/api/users/{id}/logout", post(api_user_logout))
+        .route("/api/users/{id}/delete", post(api_delete_user))
         .route("/logout", post(logout))
         .route("/browser", get(novnc_redirect))
         .route("/browser/", get(novnc_redirect))
@@ -291,11 +312,22 @@ async fn login_submit(
         tracing::warn!(%ip, "login throttled");
         return fail(StatusCode::TOO_MANY_REQUESTS, "throttled", "Too many failed attempts. Try again in 15 minutes.");
     }
-    let user_ok = auth::ct_eq(form.username.trim(), &st.cfg.auth_user);
-    let hash = st.password_hash.expose().to_string();
+    let is_admin = auth::ct_eq(form.username.trim(), &st.cfg.auth_user);
+    let user: Option<UserRow> = if is_admin {
+        None
+    } else {
+        st.db.user_by_name(&form.username.trim().to_ascii_lowercase()).await.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "looking up a user failed");
+            None
+        })
+    };
+    let hash = match &user {
+        Some(u) => u.password_hash.clone(),
+        None => st.password_hash.expose().to_string(),
+    };
     let password = form.password.clone();
     let pw_ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash)).await.unwrap_or(false);
-    if !(user_ok && pw_ok) {
+    if !(pw_ok && (is_admin || user.is_some())) {
         st.limiter.failed(ip);
         tracing::warn!(%ip, "failed login");
         tokio::time::sleep(st.login_failure_delay).await;
@@ -313,10 +345,15 @@ async fn login_submit(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(|ua| ua.chars().filter(|c| !c.is_control()).take(400).collect());
+    let (username, owner) = match &user {
+        Some(u) => (u.username.as_str(), u.id.as_str()),
+        None => (st.cfg.auth_user.as_str(), ""),
+    };
     let session = NewSession {
         id_hash: &id_hash,
         public_id: &public_id,
-        username: &st.cfg.auth_user,
+        username,
+        owner,
         csrf: &csrf,
         ip: &ip_text,
         user_agent: user_agent.as_deref(),
@@ -325,7 +362,12 @@ async fn login_submit(
         tracing::error!(error = %e, "cannot create session");
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "invalid", "Cannot create a session; try again.");
     }
-    tracing::info!(%ip, "login");
+    if owner.is_empty() {
+        tracing::info!(%ip, "login");
+    } else {
+        tracing::info!(%ip, user = %owner, "user login");
+        st.spaces.sync_logged(&st.db).await;
+    }
     let cookie = Cookie::build((SESSION_COOKIE, token))
         .http_only(true)
         .secure(https.is_some_and(|h| h.0.0))
@@ -346,6 +388,9 @@ fn time_duration(d: Duration) -> time::Duration {
 async fn logout(State(st): State<Shared>, jar: CookieJar, req: Request) -> Response {
     if let Some(a) = req.extensions().get::<Authed>() {
         let _ = st.db.delete_session(&a.id_hash).await;
+        if !a.is_admin() {
+            st.spaces.sync_logged(&st.db).await;
+        }
     }
     let cookie = Cookie::build((SESSION_COOKIE, "")).path("/").max_age(time_duration(Duration::ZERO)).build();
     (jar.remove(cookie), Json(json!({ "ok": true }))).into_response()
@@ -356,9 +401,10 @@ async fn api_session(State(st): State<Shared>, req: Request) -> Response {
     match a {
         Some(a) => Json(json!({
             "user": a.session.username,
+            "admin": a.is_admin(),
             "csrf": a.session.csrf_token,
             "display": display_view(&st.settings.current()),
-            "code": st.cfg.code_socket.as_ref().map(|_| json!({
+            "code": st.cfg.code_socket.as_ref().filter(|_| a.is_admin()).map(|_| json!({
                 "url": st.cfg.code_public_url.as_ref().map(|u| u.as_str()),
                 "port": st.cfg.code_port,
             })),
@@ -382,7 +428,7 @@ async fn api_sessions(State(st): State<Shared>, req: Request) -> Response {
     let Some(me) = req.extensions().get::<Authed>().cloned() else {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
-    match st.db.list_sessions(now_ms()).await {
+    match st.db.list_sessions(me.owner(), now_ms()).await {
         Ok(list) => {
             let sessions: Vec<SessionView> = list
                 .into_iter()
@@ -404,13 +450,20 @@ async fn api_sessions(State(st): State<Shared>, req: Request) -> Response {
     }
 }
 
-async fn api_logout_session(State(st): State<Shared>, Path(id): Path<String>) -> Response {
+async fn api_logout_session(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Path(id): Path<String>,
+) -> Response {
     if id.is_empty() || id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return api_error(StatusCode::BAD_REQUEST, "invalid session id");
     }
-    match st.db.delete_session_by_public_id(&id).await {
+    match st.db.delete_session_by_public_id(me.owner(), &id).await {
         Ok(true) => {
             tracing::info!("signed out a session from the dashboard");
+            if !me.is_admin() {
+                st.spaces.sync_logged(&st.db).await;
+            }
             Json(json!({ "logged_out": true })).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "that session has already ended"),
@@ -425,7 +478,7 @@ async fn api_logout_others(State(st): State<Shared>, req: Request) -> Response {
     let Some(me) = req.extensions().get::<Authed>().cloned() else {
         return api_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
-    match st.db.delete_other_sessions(&me.id_hash).await {
+    match st.db.delete_other_sessions(me.owner(), &me.id_hash).await {
         Ok(n) => {
             tracing::info!(sessions = n, "signed out every other session");
             Json(json!({ "logged_out": n })).into_response()
@@ -455,14 +508,21 @@ fn settings_view(st: &AppState, values: &Live) -> Response {
     .into_response()
 }
 
-async fn api_settings(State(st): State<Shared>) -> Response {
+async fn api_settings(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
     settings_view(&st, &st.settings.current())
 }
 
 async fn api_save_settings(
     State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
     Json(patch): Json<serde_json::Map<String, serde_json::Value>>,
 ) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
     let names: Vec<String> = patch.keys().cloned().collect();
     match st.settings.update(patch).await {
         Ok(values) => {
@@ -473,7 +533,10 @@ async fn api_save_settings(
     }
 }
 
-async fn api_reset_settings(State(st): State<Shared>) -> Response {
+async fn api_reset_settings(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
     match st.settings.reset().await {
         Ok(values) => {
             tracing::info!("settings reset to defaults");
@@ -530,8 +593,13 @@ struct StateQuery {
     page: Option<i64>,
 }
 
-async fn api_state(State(st): State<Shared>, Query(q): Query<StateQuery>) -> Response {
-    let counts = match st.db.counts().await {
+async fn api_state(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Query(q): Query<StateQuery>,
+) -> Response {
+    let owner = me.owner().to_string();
+    let counts = match st.db.counts(&owner).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "counting jobs failed");
@@ -540,7 +608,7 @@ async fn api_state(State(st): State<Shared>, Query(q): Query<StateQuery>) -> Res
     };
     let pages = ((counts.total + PAGE_SIZE - 1) / PAGE_SIZE).max(1);
     let page = q.page.unwrap_or(1).clamp(1, pages);
-    let jobs = match st.db.list_page(PAGE_SIZE, (page - 1) * PAGE_SIZE).await {
+    let jobs = match st.db.list_page(&owner, PAGE_SIZE, (page - 1) * PAGE_SIZE).await {
         Ok(j) => j,
         Err(e) => {
             tracing::error!(error = %e, "listing jobs failed");
@@ -552,7 +620,7 @@ async fn api_state(State(st): State<Shared>, Query(q): Query<StateQuery>) -> Res
     let live = st.settings.current();
 
     let cfg = st.cfg.clone();
-    let ingest = st.ingest.clone();
+    let ingest = st.spaces.ingest(&owner);
     let (disk, browser, orphans) = tokio::task::spawn_blocking(move || {
         let downloads = fsutil::disk_space(&cfg.download_dir).unwrap_or_default();
         let state = fsutil::disk_space(&cfg.state_dir).unwrap_or_default();
@@ -563,9 +631,9 @@ async fn api_state(State(st): State<Shared>, Query(q): Query<StateQuery>) -> Res
             min_free_bytes: cfg.min_free_disk_bytes,
         };
         let status: Option<AgentStatus> =
-            std::fs::read(cfg.agent_status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            std::fs::read(cfg.agent_status_file(&owner)).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let stale = status.as_ref().is_none_or(|s| now_ms() - s.updated_at_ms > 20_000);
-        let orphans: Vec<Orphan> = ingest.orphans();
+        let orphans: Vec<Orphan> = ingest.map(|i| i.orphans()).unwrap_or_default();
         (disk, BrowserView { status, stale }, orphans)
     })
     .await
@@ -588,7 +656,7 @@ async fn api_state(State(st): State<Shared>, Query(q): Query<StateQuery>) -> Res
         "browser": browser,
         "orphans": orphans,
         "display": display_view(&live),
-        "https": st.tls.as_ref().map(|t| t.status()),
+        "https": st.tls.as_ref().filter(|_| me.is_admin()).map(|t| t.status()),
         "settings": {
             "delete_after_success": !live.keep_local,
             "filecloud_base_url": st.cfg.filecloud_base_url.as_str(),
@@ -603,14 +671,26 @@ fn valid_job_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok()
 }
 
-async fn api_retry(State(st): State<Shared>, Path(id): Path<String>) -> Response {
-    if !valid_job_id(&id) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid job id");
+async fn owned_job(st: &AppState, me: &Authed, id: &str) -> Result<Job, (StatusCode, &'static str)> {
+    if !valid_job_id(id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid job id"));
     }
-    if let Ok(Some(job)) = st.db.get(&id).await
-        && job.file_state == state::FILE_STAGED
-        && job.upload_state == state::UP_SKIPPED
-    {
+    match st.db.get(id).await {
+        Ok(Some(job)) if job.owner == me.owner() => Ok(job),
+        Ok(_) => Err((StatusCode::NOT_FOUND, "job not found")),
+        Err(e) => {
+            tracing::error!(error = %e, "loading a job failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+        }
+    }
+}
+
+async fn api_retry(State(st): State<Shared>, Extension(me): Extension<Authed>, Path(id): Path<String>) -> Response {
+    let job = match owned_job(&st, &me, &id).await {
+        Ok(j) => j,
+        Err((status, msg)) => return api_error(status, msg),
+    };
+    if job.file_state == state::FILE_STAGED && job.upload_state == state::UP_SKIPPED {
         if !st.settings.current().filecloud {
             return api_error(
                 StatusCode::CONFLICT,
@@ -649,8 +729,8 @@ async fn api_retry(State(st): State<Shared>, Path(id): Path<String>) -> Response
     }
 }
 
-async fn api_clear_history(State(st): State<Shared>) -> Response {
-    match st.db.clear_finished().await {
+async fn api_clear_history(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
+    match st.db.clear_finished(me.owner()).await {
         Ok(n) => {
             tracing::info!(cleared = n, "cleared finished uploads from the history");
             Json(json!({ "cleared": n })).into_response()
@@ -662,9 +742,9 @@ async fn api_clear_history(State(st): State<Shared>) -> Response {
     }
 }
 
-async fn api_cancel(State(st): State<Shared>, Path(id): Path<String>) -> Response {
-    if !valid_job_id(&id) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid job id");
+async fn api_cancel(State(st): State<Shared>, Extension(me): Extension<Authed>, Path(id): Path<String>) -> Response {
+    if let Err((status, msg)) = owned_job(&st, &me, &id).await {
+        return api_error(status, msg);
     }
     match st.db.cancel_upload(&id, now_ms()).await {
         Ok(Some(session)) => {
@@ -686,8 +766,15 @@ struct ImportBody {
     name: String,
 }
 
-async fn api_import(State(st): State<Shared>, Json(body): Json<ImportBody>) -> Response {
-    match st.ingest.import_orphan(&body.name).await {
+async fn api_import(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Json(body): Json<ImportBody>,
+) -> Response {
+    let Some(ingest) = st.spaces.ingest(me.owner()) else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "downloads for this user are not ready yet");
+    };
+    match ingest.import_orphan(&body.name).await {
         Ok(id) => Json(json!({ "job_id": id })).into_response(),
         Err(e) => api_error(StatusCode::BAD_REQUEST, &crate::redact::sanitize(&e.to_string())),
     }
@@ -706,24 +793,27 @@ async fn novnc_file(State(st): State<Shared>, Path(path): Path<String>) -> Respo
 
 async fn vnc_websocket(
     State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let socket = st.cfg.vnc_socket.clone();
+    let socket = st.cfg.vnc_socket_of(me.owner());
     socket_websocket(&st, &headers, ws, socket, "remote display")
 }
 
 async fn audio_websocket(
     State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    let socket = st.cfg.audio_socket.clone();
+    let socket = st.cfg.audio_socket_of(me.owner());
     socket_websocket(&st, &headers, ws, socket, "sound")
 }
 
 async fn webrtc_websocket(
     State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
     headers: HeaderMap,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
@@ -743,7 +833,12 @@ async fn webrtc_websocket(
         Ok(ws) => ws,
         Err(e) => return e.into_response(),
     };
-    ws.on_upgrade(move |ws| crate::webrtc::signal(ws, hub, host))
+    let screen = crate::webrtc::Screen {
+        key: me.owner().to_string(),
+        vnc_socket: st.cfg.vnc_socket_of(me.owner()),
+        audio_socket: st.cfg.audio_socket_of(me.owner()),
+    };
+    ws.on_upgrade(move |ws| crate::webrtc::signal(ws, hub, host, screen))
 }
 
 const WEBRTC_HTML: &str = include_str!("../assets/webrtc.html");
@@ -835,4 +930,165 @@ async fn vnc_bridge(mut ws: WebSocket, socket: PathBuf, what: &'static str) {
         _ = to_ws => {}
     }
     tracing::debug!("{what} disconnected");
+}
+
+async fn api_users(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
+    match st.db.list_users(now_ms()).await {
+        Ok(users) => Json(json!({ "users": users, "min_password": crate::users::MIN_PASSWORD })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "listing users failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NewUserBody {
+    username: String,
+    password: String,
+}
+
+async fn api_create_user(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Json(body): Json<NewUserBody>,
+) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
+    let username = match crate::users::check_username(&body.username, &st.cfg.auth_user) {
+        Ok(u) => u,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
+    };
+    if let Err(e) = crate::users::check_user_password(&body.password) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    let password = body.password;
+    let hash = match tokio::task::spawn_blocking(move || auth::hash_password(&password)).await {
+        Ok(Ok(h)) => h,
+        _ => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot hash the password"),
+    };
+    let user = UserRow {
+        id: crate::users::new_user_id(),
+        username: username.clone(),
+        password_hash: hash,
+        created_at: now_ms(),
+    };
+    match st.db.create_user(&user).await {
+        Ok(true) => {
+            tracing::info!(user = %user.id, "user created");
+            st.spaces.sync_logged(&st.db).await;
+            Json(json!({ "id": user.id, "username": username })).into_response()
+        }
+        Ok(false) => api_error(StatusCode::CONFLICT, "a user with that name already exists"),
+        Err(e) => {
+            tracing::error!(error = %e, "creating a user failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    password: String,
+}
+
+async fn api_user_password(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Path(id): Path<String>,
+    Json(body): Json<PasswordBody>,
+) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
+    if !chromine_shared::is_valid_user_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid user id");
+    }
+    if let Err(e) = crate::users::check_user_password(&body.password) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    let password = body.password;
+    let hash = match tokio::task::spawn_blocking(move || auth::hash_password(&password)).await {
+        Ok(Ok(h)) => h,
+        _ => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "cannot hash the password"),
+    };
+    match st.db.set_user_password(&id, &hash).await {
+        Ok(true) => {
+            let _ = st.db.delete_sessions_of(&id).await;
+            tracing::info!(user = %id, "user password changed; their sessions were signed out");
+            st.spaces.sync_logged(&st.db).await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "user not found"),
+        Err(e) => {
+            tracing::error!(error = %e, "changing a user password failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+async fn api_user_logout(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Path(id): Path<String>,
+) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
+    if !chromine_shared::is_valid_user_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid user id");
+    }
+    match st.db.delete_sessions_of(&id).await {
+        Ok(n) => {
+            tracing::info!(user = %id, sessions = n, "signed out a user");
+            st.spaces.sync_logged(&st.db).await;
+            Json(json!({ "logged_out": n })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "signing out a user failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
+    }
+}
+
+async fn api_delete_user(
+    State(st): State<Shared>,
+    Extension(me): Extension<Authed>,
+    Path(id): Path<String>,
+) -> Response {
+    if !me.is_admin() {
+        return admin_only();
+    }
+    if !chromine_shared::is_valid_user_id(&id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid user id");
+    }
+    match st.db.delete_user(&id).await {
+        Ok(true) => {}
+        Ok(false) => return api_error(StatusCode::NOT_FOUND, "user not found"),
+        Err(e) => {
+            tracing::error!(error = %e, "deleting a user failed");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "database error");
+        }
+    }
+    st.spaces.sync_logged(&st.db).await;
+    let jobs = st.db.delete_jobs_of(&id).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "removing a deleted user's transfers failed");
+        Vec::new()
+    });
+    let jobs_dir = st.cfg.jobs_dir();
+    let removed = jobs.len();
+    let _ = tokio::task::spawn_blocking(move || {
+        for job in jobs {
+            if uuid::Uuid::parse_str(&job.id).is_ok() {
+                let _ = std::fs::remove_dir_all(jobs_dir.join(&job.id));
+            }
+        }
+    })
+    .await;
+    tracing::info!(user = %id, transfers = removed, "user deleted");
+    Json(json!({ "deleted": true })).into_response()
 }

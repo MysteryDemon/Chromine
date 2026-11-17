@@ -18,6 +18,7 @@ chromine/
 │   │   │   ├── main.rs
 │   │   │   ├── native.rs
 │   │   │   ├── prefs.rs
+│   │   │   ├── users.rs
 │   │   │   └── video.rs
 │   │   └── Cargo.toml
 │   ├── shared/
@@ -43,6 +44,7 @@ chromine/
 │       │   ├── redact.rs
 │       │   ├── ui.rs
 │       │   ├── upload.rs
+│       │   ├── users.rs
 │       │   └── web.rs
 │       └── Cargo.toml
 ├── docker/
@@ -94,15 +96,13 @@ chromine/
 │   │   │   │   ├── state-badge.tsx
 │   │   │   │   ├── top-bar.tsx
 │   │   │   │   └── transfers-panel.tsx
-│   │   │   ├── pypen/
-│   │   │   │   ├── alert.tsx
-│   │   │   │   ├── button.tsx
-│   │   │   │   ├── card.tsx
-│   │   │   │   ├── input.tsx
-│   │   │   │   └── label.tsx
 │   │   │   └── ui/
 │   │   │       ├── alert-dialog.tsx
+│   │   │       ├── alert.tsx
 │   │   │       ├── button.tsx
+│   │   │       ├── card.tsx
+│   │   │       ├── input.tsx
+│   │   │       ├── label.tsx
 │   │   │       ├── sonner.tsx
 │   │   │       ├── tabs.tsx
 │   │   │       └── tooltip.tsx

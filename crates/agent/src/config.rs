@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -51,6 +51,9 @@ pub struct AgentConfig {
     pub links_dir: PathBuf,
     pub monitor_state_file: PathBuf,
     pub start_urls: Vec<String>,
+    pub scale_file: PathBuf,
+    pub users_dir: PathBuf,
+    pub user: Option<String>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -73,6 +76,8 @@ impl std::fmt::Debug for AgentConfig {
             .field("theme", &self.theme)
             .field("links_dir", &self.links_dir)
             .field("monitor_state_file", &self.monitor_state_file)
+            .field("users_dir", &self.users_dir)
+            .field("user", &self.user)
             .finish()
     }
 }
@@ -107,6 +112,7 @@ fn parse_bool(name: &str, default: bool) -> Result<bool> {
 impl AgentConfig {
     pub fn from_env() -> Result<Self> {
         let manage_display = parse_bool("AGENT_MANAGE_DISPLAY", true)?;
+        let vnc_socket = PathBuf::from(env("VNC_SOCKET").unwrap_or_else(|| "/vnc/vnc.sock".into()));
         let cfg = AgentConfig {
             download_dir: PathBuf::from(env("DOWNLOAD_DIR").unwrap_or_else(|| "/downloads".into())),
             profile_dir: PathBuf::from(env("CHROME_PROFILE_DIR").unwrap_or_else(|| "/profile".into())),
@@ -118,7 +124,8 @@ impl AgentConfig {
             display_scale: parse_f64("DISPLAY_SCALE", 1.0)?,
             manage_display,
             headless: parse_bool("CHROME_HEADLESS", false)?,
-            vnc_socket: PathBuf::from(env("VNC_SOCKET").unwrap_or_else(|| "/vnc/vnc.sock".into())),
+            scale_file: vnc_socket.with_file_name(chromine_shared::DISPLAY_SCALE_FILE),
+            vnc_socket,
             audio: parse_bool("AUDIO_ENABLED", true)?,
             audio_socket: PathBuf::from(env("AUDIO_SOCKET").unwrap_or_else(|| "/vnc/audio.sock".into())),
             pulseaudio_bin: PathBuf::from(env("PULSEAUDIO_BIN").unwrap_or_else(|| "pulseaudio".into())),
@@ -137,13 +144,16 @@ impl AgentConfig {
                 env("MONITOR_STATE_FILE").unwrap_or_else(|| DEFAULT_MONITOR_STATE_FILE.into()),
             ),
             start_urls: Vec::new(),
+            users_dir: PathBuf::from(env("USERS_DIR").unwrap_or_else(|| "/users".into())),
+            user: None,
         };
         if !cfg.download_dir.is_absolute()
             || !cfg.profile_dir.is_absolute()
             || !cfg.vnc_socket.is_absolute()
             || !cfg.audio_socket.is_absolute()
+            || !cfg.users_dir.is_absolute()
         {
-            bail!("DOWNLOAD_DIR, CHROME_PROFILE_DIR, VNC_SOCKET and AUDIO_SOCKET must be absolute paths");
+            bail!("DOWNLOAD_DIR, CHROME_PROFILE_DIR, VNC_SOCKET, AUDIO_SOCKET and USERS_DIR must be absolute paths");
         }
         if !(320..=7680).contains(&cfg.screen_width) || !(240..=4320).contains(&cfg.screen_height) {
             bail!("SCREEN_WIDTH/SCREEN_HEIGHT are out of range");
@@ -168,5 +178,86 @@ impl AgentConfig {
 
     pub fn display(&self) -> String {
         format!(":{}", self.display_number)
+    }
+
+    pub fn vnc_root(&self) -> &Path {
+        self.vnc_socket.parent().unwrap_or(Path::new("/"))
+    }
+
+    pub fn users_file(&self) -> PathBuf {
+        self.vnc_root().join(chromine_shared::USERS_FILE)
+    }
+
+    pub fn user_run_dir(&self, id: &str) -> PathBuf {
+        self.users_dir.join(id).join("run")
+    }
+
+    pub fn for_user(&self, id: &str, display_number: u32) -> AgentConfig {
+        let root = self.users_dir.join(id);
+        let sockets = chromine_shared::user_dir(self.vnc_root(), id);
+        let run = self.user_run_dir(id);
+        AgentConfig {
+            download_dir: chromine_shared::user_dir(&self.download_dir, id),
+            profile_dir: root.join("profile"),
+            home_dir: root.join("home"),
+            display_number,
+            vnc_socket: sockets.join(chromine_shared::VNC_SOCKET_NAME),
+            audio_socket: sockets.join(chromine_shared::AUDIO_SOCKET_NAME),
+            video_dir: run.join("video"),
+            monitor_state_file: run.join("monitor.json"),
+            start_urls: Vec::new(),
+            user: Some(id.to_string()),
+            ..self.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_user_instance_gets_its_own_paths_and_shares_the_scale_file() {
+        let base = AgentConfig {
+            download_dir: "/downloads".into(),
+            profile_dir: "/profile".into(),
+            chrome_bin: "/usr/bin/google-chrome-stable".into(),
+            home_dir: "/tmp/chrome-home".into(),
+            display_number: 1,
+            screen_width: 1600,
+            screen_height: 900,
+            display_scale: 1.0,
+            manage_display: true,
+            headless: false,
+            vnc_socket: "/vnc/vnc.sock".into(),
+            audio: true,
+            audio_socket: "/vnc/audio.sock".into(),
+            pulseaudio_bin: "pulseaudio".into(),
+            parec_bin: "parec".into(),
+            video_dir: "/tmp/chromine-video".into(),
+            ytdlp_bin: "yt-dlp".into(),
+            min_free_disk_bytes: 0,
+            safe_browsing: false,
+            theme: Theme::Dark,
+            links_dir: "/code-links".into(),
+            monitor_state_file: "/tmp/m.json".into(),
+            start_urls: vec![],
+            scale_file: "/vnc/display-scale".into(),
+            users_dir: "/users".into(),
+            user: None,
+        };
+        let id = "0123456789abcdef0123456789abcdef";
+        let u = base.for_user(id, 7);
+        assert_eq!(u.download_dir, PathBuf::from(format!("/downloads/users/{id}")));
+        assert_eq!(u.profile_dir, PathBuf::from(format!("/users/{id}/profile")));
+        assert_eq!(u.home_dir, PathBuf::from(format!("/users/{id}/home")));
+        assert_eq!(u.vnc_socket, PathBuf::from(format!("/vnc/users/{id}/vnc.sock")));
+        assert_eq!(u.audio_socket, PathBuf::from(format!("/vnc/users/{id}/audio.sock")));
+        assert_eq!(u.monitor_state_file, PathBuf::from(format!("/users/{id}/run/monitor.json")));
+        assert_eq!(u.video_dir, PathBuf::from(format!("/users/{id}/run/video")));
+        assert_eq!(u.scale_file, base.scale_file);
+        assert_eq!(u.display(), ":7");
+        assert_eq!(u.user.as_deref(), Some(id));
+        assert_eq!(base.users_file(), PathBuf::from("/vnc/users.json"));
     }
 }

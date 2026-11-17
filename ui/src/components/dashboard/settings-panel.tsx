@@ -1,8 +1,10 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useState, type FormEvent } from "react";
 import {
   ChevronDown,
+  Eye,
+  EyeOff,
   HardDriveDownload,
   KeyRound,
   LoaderCircle,
@@ -12,7 +14,11 @@ import {
   Save,
   ScreenShare,
   Smartphone,
+  Trash2,
   TriangleAlert,
+  UserPlus,
+  UserRound,
+  Users,
   Zap,
   type LucideIcon,
 } from "lucide-react";
@@ -32,16 +38,22 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
+  createUser,
+  deleteUser,
   getSessions,
   getSettings,
+  getUsers,
   logoutOtherSessions,
   logoutSession,
+  logoutUser,
   saveSettings,
+  setUserPassword,
   type DeviceMode,
   type DisplayView,
   type SessionInfo,
   type Settings,
   type SettingsResponse,
+  type UserInfo,
 } from "@/lib/api";
 import { formatAgo, formatTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -64,7 +76,7 @@ const QUALITIES: Option<Settings["webrtc_quality"]>[] = [
   { value: "high", label: "High" },
   { value: "max", label: "Max" },
 ];
-const SECTIONS = ["downloads", "display", "webrtc", "vnc", "sessions"];
+const SECTIONS = ["downloads", "display", "webrtc", "vnc", "users", "sessions"];
 const OPEN_KEY = "chromine-settings-open";
 
 function readOpen(): string[] {
@@ -327,6 +339,409 @@ function SessionItem({
   );
 }
 
+const FIELD =
+  "h-9 w-full min-w-0 rounded-full bg-white/[0.04] px-3.5 text-base text-white ring-1 ring-white/[0.08] outline-none placeholder:text-white/30 focus:ring-white/30 sm:text-[13px]";
+const ACTION =
+  "h-8 shrink-0 rounded-full bg-white/[0.04] px-3 text-[13px] text-white/75 ring-1 ring-white/[0.08] hover:bg-white/[0.09] hover:text-white dark:hover:bg-white/[0.09]";
+const DANGER =
+  "h-8 shrink-0 rounded-full bg-white/[0.04] px-3 text-[13px] text-white/75 ring-1 ring-white/[0.08] hover:bg-destructive/15 hover:text-destructive dark:hover:bg-destructive/15";
+const PRIMARY =
+  "h-9 shrink-0 rounded-full bg-white px-4 text-black hover:bg-white/85 disabled:bg-white/[0.06] disabled:text-white/35";
+const DIALOG = "rounded-2xl border-0 bg-[#0b0b0b] shadow-[0_30px_120px_rgba(0,0,0,1)] ring-1 ring-white/10";
+const DIALOG_CANCEL =
+  "rounded-full border-0 bg-white/[0.05] ring-1 ring-white/10 hover:bg-white/10 dark:bg-white/[0.05] dark:hover:bg-white/10";
+
+function SessionsSection({ active, open }: { active: boolean; open: boolean }) {
+  const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
+  const [endingSession, setEndingSession] = useState<string | null>(null);
+
+  const loadSessions = () => {
+    getSessions()
+      .then((r) => setSessions(r.sessions))
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    if (active) loadSessions();
+  }, [active, open]);
+
+  const endSession = async (s: SessionInfo) => {
+    setEndingSession(s.id);
+    try {
+      await logoutSession(s.id);
+      toast.success("Signed out", { description: deviceName(s.user_agent) });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not sign out that session");
+    } finally {
+      setEndingSession(null);
+      loadSessions();
+    }
+  };
+
+  const endOtherSessions = async () => {
+    try {
+      const r = await logoutOtherSessions();
+      toast.success(r.logged_out === 1 ? "Signed out 1 other session" : `Signed out ${r.logged_out} other sessions`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not sign out the other sessions");
+    } finally {
+      loadSessions();
+    }
+  };
+
+  const sessionList = [...(sessions ?? [])].sort(
+    (a, b) => Number(b.current) - Number(a.current) || b.last_seen_at - a.last_seen_at,
+  );
+  const others = sessionList.filter((s) => !s.current).length;
+  const sessionSummary =
+    sessions === null
+      ? "Devices signed in to this dashboard"
+      : others === 0
+        ? "Only this device is signed in"
+        : `${sessionList.length} signed in · ${others} other device${others === 1 ? "" : "s"}`;
+  const now = Date.now();
+
+  return (
+    <Section id="sessions" icon={KeyRound} title="Sessions" summary={sessionSummary} unsaved={0}>
+      {sessions === null ? (
+        <p className="flex items-center gap-2 px-4 py-4 text-xs text-white/40 sm:px-5">
+          <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> Loading sessions…
+        </p>
+      ) : (
+        sessionList.map((s) => (
+          <SessionItem
+            key={s.id}
+            session={s}
+            now={now}
+            busy={endingSession === s.id}
+            onLogout={() => endSession(s)}
+          />
+        ))
+      )}
+      {others > 0 ? (
+        <div className="flex justify-end px-4 py-3 sm:px-5">
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-9 rounded-full bg-white/[0.04] px-3.5 text-[13px] text-white/75 ring-1 ring-white/[0.08] hover:bg-destructive/15 hover:text-destructive dark:hover:bg-destructive/15"
+              >
+                <LogOut />
+                Log out all other sessions
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent className={DIALOG}>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Log out every other session?</AlertDialogTitle>
+                <AlertDialogDescription className="text-white/55">
+                  {others === 1 ? "1 other device" : `${others} other devices`} will have to sign in again. This device stays signed in.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel className={DIALOG_CANCEL}>Cancel</AlertDialogCancel>
+                <AlertDialogAction className="rounded-full bg-white text-black hover:bg-white/85" onClick={endOtherSessions}>
+                  Log out others
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      ) : null}
+    </Section>
+  );
+}
+
+function PasswordField({
+  value,
+  onChange,
+  label,
+  autoFocus,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  label: string;
+  autoFocus?: boolean;
+}) {
+  const [shown, setShown] = useState(false);
+  return (
+    <div className="relative min-w-0 sm:flex-1">
+      <input
+        type={shown ? "text" : "password"}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={label}
+        aria-label={label}
+        autoComplete="new-password"
+        autoCapitalize="off"
+        spellCheck={false}
+        autoFocus={autoFocus}
+        className={cn(FIELD, "pr-10")}
+      />
+      <button
+        type="button"
+        onClick={() => setShown(!shown)}
+        aria-label={shown ? "Hide password" : "Show password"}
+        className="absolute top-1/2 right-1 grid size-7 -translate-y-1/2 cursor-pointer place-items-center rounded-full text-white/45 outline-none hover:text-white focus-visible:ring-2 focus-visible:ring-white/40"
+      >
+        {shown ? <EyeOff className="size-3.5" aria-hidden /> : <Eye className="size-3.5" aria-hidden />}
+      </button>
+    </div>
+  );
+}
+
+function UserItem({
+  user: u,
+  now,
+  busy,
+  editing,
+  minPassword,
+  onEdit,
+  onPassword,
+  onLogout,
+  onDelete,
+}: {
+  user: UserInfo;
+  now: number;
+  busy: boolean;
+  editing: boolean;
+  minPassword: number;
+  onEdit: (on: boolean) => void;
+  onPassword: (password: string) => Promise<boolean>;
+  onLogout: () => void;
+  onDelete: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const online = u.sessions > 0;
+  const details = [
+    online ? (u.sessions === 1 ? "signed in on 1 device" : `signed in on ${u.sessions} devices`) : "signed out",
+    u.last_seen_at ? `active ${formatAgo(u.last_seen_at, now)}` : "never signed in",
+    `created ${formatTime(u.created_at)}`,
+  ];
+  const close = () => {
+    setPassword("");
+    onEdit(false);
+  };
+  const save = async (e: FormEvent) => {
+    e.preventDefault();
+    if (await onPassword(password)) close();
+  };
+  return (
+    <div className="px-4 py-3.5 sm:px-5">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white/[0.04] text-white/60 ring-1 ring-white/[0.07]">
+          <UserRound className="size-4" aria-hidden />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="flex items-center gap-2 text-sm font-medium text-white">
+            <span className="truncate">{u.username}</span>
+            {online ? (
+              <span className="shrink-0 rounded-full bg-success/[0.12] px-2 py-px text-[11px] font-medium text-success ring-1 ring-success/25">
+                Signed in
+              </span>
+            ) : null}
+          </p>
+          <p className="mt-0.5 text-xs leading-relaxed break-words text-white/45 tabular-nums">{details.join(" · ")}</p>
+        </div>
+        <div className="flex w-full items-center justify-end gap-1.5 sm:w-auto">
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => (editing ? close() : onEdit(true))} className={ACTION}>
+            <KeyRound />
+            Password
+          </Button>
+          {online ? (
+            <Button variant="ghost" size="sm" disabled={busy} onClick={onLogout} className={DANGER}>
+              <LogOut />
+              Sign out
+            </Button>
+          ) : null}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="ghost" size="sm" disabled={busy} className={DANGER}>
+                <Trash2 />
+                Delete
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent className={DIALOG}>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete {u.username}?</AlertDialogTitle>
+                <AlertDialogDescription className="text-white/55">
+                  They are signed out, and their Chrome profile, saved logins, downloads and transfer list are removed from
+                  this server. This can&apos;t be undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel className={DIALOG_CANCEL}>Cancel</AlertDialogCancel>
+                <AlertDialogAction className="rounded-full bg-destructive text-white hover:bg-destructive/85" onClick={onDelete}>
+                  Delete user
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </div>
+      {editing ? (
+        <form onSubmit={save} className="mt-3 grid gap-2 sm:pl-12">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <PasswordField value={password} onChange={setPassword} label="New password" autoFocus />
+            <div className="flex justify-end gap-1.5">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={close}
+                className="h-9 rounded-full px-3.5 text-[13px] text-white/60 hover:bg-white/[0.07] hover:text-white dark:hover:bg-white/[0.07]"
+              >
+                Cancel
+              </Button>
+              <Button type="submit" size="sm" disabled={busy || password.length < minPassword} className={PRIMARY}>
+                {busy ? <LoaderCircle className="animate-spin" /> : <Save />}
+                Save
+              </Button>
+            </div>
+          </div>
+          <p className="text-xs leading-relaxed text-white/45">
+            At least {minPassword} characters.
+            {online ? ` ${u.username} is signed out and must sign in with the new password.` : ""}
+          </p>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
+function UsersSection({ active, open }: { active: boolean; open: boolean }) {
+  const [users, setUsers] = useState<UserInfo[] | null>(null);
+  const [minPassword, setMinPassword] = useState(8);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
+
+  const load = () => {
+    getUsers()
+      .then((r) => {
+        setUsers(r.users);
+        setMinPassword(r.min_password);
+      })
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    if (active) load();
+  }, [active, open]);
+
+  useEffect(() => {
+    if (!active || !open) return;
+    const t = setInterval(load, 10_000);
+    return () => clearInterval(t);
+  }, [active, open]);
+
+  const create = async (e: FormEvent) => {
+    e.preventDefault();
+    if (creating) return;
+    setCreating(true);
+    try {
+      const r = await createUser(username, password);
+      toast.success(`Created ${r.username}`, { description: "They can sign in now with the password you set." });
+      setUsername("");
+      setPassword("");
+      load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not create the user");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const act = async (u: UserInfo, run: () => Promise<unknown>, done: string, description?: string) => {
+    setBusy(u.id);
+    try {
+      await run();
+      toast.success(done, description ? { description } : undefined);
+      return true;
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Something went wrong");
+      return false;
+    } finally {
+      setBusy(null);
+      load();
+    }
+  };
+
+  const signedIn = users?.filter((u) => u.sessions > 0).length ?? 0;
+  const summary =
+    users === null
+      ? "Logins for other people, each with their own Chrome"
+      : users.length === 0
+        ? "No other users yet"
+        : `${users.length} user${users.length === 1 ? "" : "s"} · ${signedIn} signed in`;
+  const now = Date.now();
+
+  return (
+    <Section id="users" icon={Users} title="Users" summary={summary} unsaved={0}>
+      <form onSubmit={create} className="grid gap-3 px-4 py-4 sm:px-5">
+        <div>
+          <p className="text-sm font-medium text-white">New user</p>
+          <p className="mt-1 text-xs leading-relaxed text-white/45">
+            Each user gets their own Chrome, downloads and transfers. It starts when they sign in and closes when they sign
+            out. Passwords need at least {minPassword} characters.
+          </p>
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="Username"
+            aria-label="Username"
+            autoComplete="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            className={cn(FIELD, "sm:flex-1")}
+          />
+          <PasswordField value={password} onChange={setPassword} label="Password" />
+          <Button
+            type="submit"
+            size="sm"
+            disabled={creating || username.trim().length < 3 || password.length < minPassword}
+            className={PRIMARY}
+          >
+            {creating ? <LoaderCircle className="animate-spin" /> : <UserPlus />}
+            Create user
+          </Button>
+        </div>
+      </form>
+      {users === null ? (
+        <p className="flex items-center gap-2 px-4 py-4 text-xs text-white/40 sm:px-5">
+          <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> Loading users…
+        </p>
+      ) : (
+        users.map((u) => (
+          <UserItem
+            key={u.id}
+            user={u}
+            now={now}
+            busy={busy === u.id}
+            editing={editing === u.id}
+            minPassword={minPassword}
+            onEdit={(on) => setEditing(on ? u.id : null)}
+            onPassword={(p) =>
+              act(
+                u,
+                () => setUserPassword(u.id, p),
+                "Password changed",
+                u.sessions > 0 ? `${u.username} was signed out.` : undefined,
+              )
+            }
+            onLogout={() => act(u, () => logoutUser(u.id), `Signed out ${u.username}`, "Their Chrome closes in a few seconds.")}
+            onDelete={() => act(u, () => deleteUser(u.id), `Deleted ${u.username}`)}
+          />
+        ))
+      )}
+    </Section>
+  );
+}
+
 function modeName(m: string) {
   return m === "vnc" ? "VNC" : "WebRTC";
 }
@@ -367,11 +782,13 @@ function display(v: Settings): DisplayView {
 }
 
 export const SettingsPanel = memo(function SettingsPanel({
+  admin,
   active,
   onDisplay,
   deviceMode,
   onDeviceMode,
 }: {
+  admin: boolean;
   active: boolean;
   onDisplay: (d: DisplayView) => void;
   deviceMode: DeviceMode;
@@ -383,8 +800,6 @@ export const SettingsPanel = memo(function SettingsPanel({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [open, setOpen] = useState<string[]>(readOpen);
-  const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
-  const [endingSession, setEndingSession] = useState<string | null>(null);
 
   const patch = data && draft ? unsavedSettings(data.values, draft) : {};
   const unsaved = Object.keys(patch).length + (device !== deviceMode ? 1 : 0);
@@ -400,19 +815,9 @@ export const SettingsPanel = memo(function SettingsPanel({
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   };
 
-  const loadSessions = () => {
-    getSessions()
-      .then((r) => setSessions(r.sessions))
-      .catch(() => {});
-  };
-
   useEffect(() => {
-    if (active && !unsaved) load();
-  }, [active]);
-
-  useEffect(() => {
-    if (active) loadSessions();
-  }, [active]);
+    if (active && admin && !unsaved) load();
+  }, [active, admin]);
 
   useEffect(() => {
     if (!unsaved) return;
@@ -420,6 +825,23 @@ export const SettingsPanel = memo(function SettingsPanel({
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [unsaved > 0]);
+
+  const remember = (sections: string[]) => {
+    setOpen(sections);
+    try {
+      localStorage.setItem(OPEN_KEY, JSON.stringify(sections));
+    } catch {}
+  };
+
+  if (!admin) {
+    return (
+      <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-4 px-3 pt-4 pb-24 sm:gap-5 sm:px-5 sm:pt-5">
+        <Accordion.Root type="multiple" value={open} onValueChange={remember} className="grid grid-cols-1 gap-3 sm:gap-4">
+          <SessionsSection active={active} open={open.includes("sessions")} />
+        </Accordion.Root>
+      </div>
+    );
+  }
 
   if (!data || !draft) {
     return (
@@ -472,51 +894,8 @@ export const SettingsPanel = memo(function SettingsPanel({
     setDevice(deviceMode);
   };
 
-  const remember = (sections: string[]) => {
-    if (sections.includes("sessions") && !open.includes("sessions")) loadSessions();
-    setOpen(sections);
-    try {
-      localStorage.setItem(OPEN_KEY, JSON.stringify(sections));
-    } catch {}
-  };
   const count = (keys: (keyof Settings)[]) => keys.filter(pending).length;
   const label = <T extends string>(options: Option<T>[], value: T) => options.find((o) => o.value === value)?.label ?? value;
-
-  const endSession = async (s: SessionInfo) => {
-    setEndingSession(s.id);
-    try {
-      await logoutSession(s.id);
-      toast.success("Signed out", { description: deviceName(s.user_agent) });
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Could not sign out that session");
-    } finally {
-      setEndingSession(null);
-      loadSessions();
-    }
-  };
-
-  const endOtherSessions = async () => {
-    try {
-      const r = await logoutOtherSessions();
-      toast.success(r.logged_out === 1 ? "Signed out 1 other session" : `Signed out ${r.logged_out} other sessions`);
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Could not sign out the other sessions");
-    } finally {
-      loadSessions();
-    }
-  };
-
-  const sessionList = [...(sessions ?? [])].sort(
-    (a, b) => Number(b.current) - Number(a.current) || b.last_seen_at - a.last_seen_at,
-  );
-  const others = sessionList.filter((s) => !s.current).length;
-  const sessionSummary =
-    sessions === null
-      ? "Devices signed in to this dashboard"
-      : others === 0
-        ? "Only this device is signed in"
-        : `${sessionList.length} signed in · ${others} other device${others === 1 ? "" : "s"}`;
-  const now = Date.now();
 
   const scales = SCALES.includes(v.display_scale) ? SCALES : [...SCALES, v.display_scale].sort((a, b) => a - b);
 
@@ -717,61 +1096,8 @@ export const SettingsPanel = memo(function SettingsPanel({
             <Level label="Compression" value={v.vnc_compression} onCommit={(vnc_compression) => set({ vnc_compression })} />
           </Row>
         </Section>
-        <Section
-          id="sessions"
-          icon={KeyRound}
-          title="Sessions"
-          summary={sessionSummary}
-          unsaved={0}
-        >
-          {sessions === null ? (
-            <p className="flex items-center gap-2 px-4 py-4 text-xs text-white/40 sm:px-5">
-              <LoaderCircle className="size-3.5 animate-spin" aria-hidden /> Loading sessions…
-            </p>
-          ) : (
-            sessionList.map((s) => (
-              <SessionItem
-                key={s.id}
-                session={s}
-                now={now}
-                busy={endingSession === s.id}
-                onLogout={() => endSession(s)}
-              />
-            ))
-          )}
-          {others > 0 ? (
-            <div className="flex justify-end px-4 py-3 sm:px-5">
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-9 rounded-full bg-white/[0.04] px-3.5 text-[13px] text-white/75 ring-1 ring-white/[0.08] hover:bg-destructive/15 hover:text-destructive dark:hover:bg-destructive/15"
-                  >
-                    <LogOut />
-                    Log out all other sessions
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent className="rounded-2xl border-0 bg-[#0b0b0b] shadow-[0_30px_120px_rgba(0,0,0,1)] ring-1 ring-white/10">
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Log out every other session?</AlertDialogTitle>
-                    <AlertDialogDescription className="text-white/55">
-                      {others === 1 ? "1 other device" : `${others} other devices`} will have to sign in again. This device stays signed in.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel className="rounded-full border-0 bg-white/[0.05] ring-1 ring-white/10 hover:bg-white/10 dark:bg-white/[0.05] dark:hover:bg-white/10">
-                      Cancel
-                    </AlertDialogCancel>
-                    <AlertDialogAction className="rounded-full bg-white text-black hover:bg-white/85" onClick={endOtherSessions}>
-                      Log out others
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </div>
-          ) : null}
-        </Section>
+        <UsersSection active={active} open={open.includes("users")} />
+        <SessionsSection active={active} open={open.includes("sessions")} />
       </Accordion.Root>
 
       <div className="flex px-1">

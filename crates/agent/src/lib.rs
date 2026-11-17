@@ -7,6 +7,7 @@ pub mod history;
 pub mod links;
 pub mod native;
 pub mod prefs;
+pub mod users;
 pub mod video;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -323,7 +324,7 @@ fn watch_display_scale(cfg: &AgentConfig, shutdown: watch::Receiver<bool>) -> wa
     if cfg.headless {
         return rx;
     }
-    let file = cfg.vnc_socket.with_file_name(chromine_shared::DISPLAY_SCALE_FILE);
+    let file = cfg.scale_file.clone();
     let mut sd = shutdown;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -341,23 +342,19 @@ fn watch_display_scale(cfg: &AgentConfig, shutdown: watch::Receiver<bool>) -> wa
     rx
 }
 
-pub async fn run(mut cfg: AgentConfig) -> Result<()> {
+pub type Sandbox = (Option<bool>, Option<String>);
+
+pub async fn run(cfg: AgentConfig) -> Result<()> {
     unsafe {
         libc::umask(0o007);
     }
-    prepare_directories(&cfg)?;
-    if let Some(s) = read_display_scale(&cfg.vnc_socket.with_file_name(chromine_shared::DISPLAY_SCALE_FILE)) {
-        cfg.display_scale = s;
-    }
-    let shared = Shared::new(&cfg);
-
     let (ok, detail) = sandbox_self_test().await;
     if ok {
         tracing::info!("{detail}");
     } else {
         tracing::error!("{detail}");
     }
-    *shared.sandbox.lock().unwrap() = (Some(ok), Some(detail));
+    let sandbox: Sandbox = (Some(ok), Some(detail));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     {
@@ -372,6 +369,25 @@ pub async fn run(mut cfg: AgentConfig) -> Result<()> {
             let _ = tx.send(true);
         });
     }
+
+    let users = (cfg.manage_display && !cfg.headless)
+        .then(|| tokio::spawn(users::supervise(cfg.clone(), sandbox.clone(), shutdown_rx.clone())));
+    let result = run_instance(cfg, sandbox, shutdown_rx).await;
+    let _ = shutdown_tx.send(true);
+    if let Some(task) = users {
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+    }
+    result
+}
+
+pub async fn run_instance(mut cfg: AgentConfig, sandbox: Sandbox, mut stop: watch::Receiver<bool>) -> Result<()> {
+    prepare_directories(&cfg)?;
+    if let Some(s) = read_display_scale(&cfg.scale_file) {
+        cfg.display_scale = s;
+    }
+    let shared = Shared::new(&cfg);
+    *shared.sandbox.lock().unwrap() = sandbox;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut display = if cfg.manage_display { Some(display::start(&cfg).await?) } else { None };
     let audio_task = if cfg.audio {
@@ -407,14 +423,13 @@ pub async fn run(mut cfg: AgentConfig) -> Result<()> {
     let scale = watch_display_scale(&cfg, shutdown_rx.clone());
     let chrome_task = tokio::spawn(chrome_loop(cfg.clone(), shared.clone(), shutdown_rx.clone(), scale));
     let video_task = tokio::spawn(video::run_queue(cfg.clone(), shutdown_rx.clone()));
-    if !cfg.headless {
+    if !cfg.headless && cfg.user.is_none() {
         tokio::spawn(links::run(cfg.clone(), shared.clone(), shutdown_rx.clone()));
     }
 
     let mut failure: Option<String> = None;
     if let Some(stack) = display.as_mut() {
-        let mut sd = shutdown_rx.clone();
-        loop {
+        while !*stop.borrow() {
             tokio::select! {
                 s = stack.xvnc.wait() => { failure = Some(format!("Xvnc exited ({s:?})")); break; }
                 s = stack.openbox.wait() => {
@@ -422,15 +437,16 @@ pub async fn run(mut cfg: AgentConfig) -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     stack.openbox = display::spawn_openbox(&cfg).await?;
                 }
-                _ = sd.changed() => break,
+                _ = stop.changed() => break,
             }
         }
-    } else {
-        let mut sd = shutdown_rx.clone();
-        let _ = sd.changed().await;
+    } else if !*stop.borrow() {
+        let _ = stop.changed().await;
     }
     if let Some(f) = &failure {
-        tracing::error!("{f}; stopping so the container restarts");
+        if cfg.user.is_none() {
+            tracing::error!("{f}; stopping so the container restarts");
+        }
         shared.set_error(f);
     }
     let _ = shutdown_tx.send(true);
@@ -443,7 +459,11 @@ pub async fn run(mut cfg: AgentConfig) -> Result<()> {
         display::stop_child(&mut stack.openbox, Duration::from_secs(3)).await;
         display::stop_child(&mut stack.xvnc, Duration::from_secs(3)).await;
     }
-    write_status(&cfg, &shared);
+    if cfg.user.is_some() {
+        let _ = std::fs::remove_file(cfg.events_dir().join(chromine_shared::AGENT_STATUS_FILE));
+    } else {
+        write_status(&cfg, &shared);
+    }
     match failure {
         Some(f) => bail!(f),
         None => Ok(()),

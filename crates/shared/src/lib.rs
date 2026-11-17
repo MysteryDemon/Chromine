@@ -10,8 +10,39 @@ pub const COMPLETED_SUBDIR: &str = "completed";
 pub const JOBS_SUBDIR: &str = "jobs";
 pub const AGENT_STATUS_FILE: &str = "agent-status.json";
 pub const DISPLAY_SCALE_FILE: &str = "display-scale";
+pub const USERS_FILE: &str = "users.json";
+pub const USERS_SUBDIR: &str = "users";
+pub const VNC_SOCKET_NAME: &str = "vnc.sock";
+pub const AUDIO_SOCKET_NAME: &str = "audio.sock";
 
 pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsersFile {
+    pub schema: u32,
+    pub known: Vec<String>,
+    pub active: Vec<String>,
+}
+
+pub fn is_valid_user_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub fn user_dir(root: &std::path::Path, id: &str) -> std::path::PathBuf {
+    root.join(USERS_SUBDIR).join(id)
+}
+
+pub fn read_users_file(path: &std::path::Path) -> Option<UsersFile> {
+    let (file, meta) = fsutil::open_regular_nofollow(path).ok()?;
+    if meta.len() > MAX_RECORD_BYTES {
+        return None;
+    }
+    let users: UsersFile = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    (users.schema == SCHEMA_VERSION
+        && users.known.iter().chain(&users.active).all(|id| is_valid_user_id(id))
+        && users.active.iter().all(|id| users.known.contains(id)))
+    .then_some(users)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

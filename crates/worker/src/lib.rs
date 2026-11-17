@@ -10,6 +10,7 @@ pub mod settings;
 pub mod tls;
 pub mod ui;
 pub mod upload;
+pub mod users;
 pub mod web;
 pub mod webrtc;
 
@@ -85,7 +86,7 @@ impl App {
         db.purge_sessions(now_ms()).await?;
         let (password_hash, password_changed) = auth::stored_password_hash(&cfg.state_dir, cfg.auth_password.expose())?;
         if password_changed {
-            let n = db.delete_all_sessions().await?;
+            let n = db.delete_sessions_of("").await?;
             if n > 0 {
                 tracing::warn!(sessions = n, "the dashboard password changed; every session was signed out");
             }
@@ -109,6 +110,7 @@ impl App {
         };
         let ingest = Ingest {
             db: db.clone(),
+            owner: String::new(),
             incoming: cfg.incoming_dir(),
             completed: cfg.completed_dir(),
             jobs_dir: cfg.jobs_dir(),
@@ -152,7 +154,7 @@ impl App {
             settings,
             cfg: cfg.clone(),
             db: db.clone(),
-            ingest: ingest.clone(),
+            spaces: users::Spaces::new(cfg.clone(), ingest.clone()),
             uploader: uploader.clone(),
             password_hash: config::Secret::new(password_hash),
             upload_wake,
@@ -178,6 +180,20 @@ impl App {
         }));
         handles.push(tokio::spawn(self.uploader.clone().run(shutdown.clone())));
         handles.push(tokio::spawn(self.cleanup.clone().run(shutdown.clone())));
+        let web = self.web.clone();
+        let sd = shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => web.spaces.sync_logged(&web.db).await,
+                    _ = sd.cancelled() => {
+                        web.spaces.shutdown();
+                        return;
+                    }
+                }
+            }
+        }));
         let db = self.db.clone();
         let sd = shutdown.clone();
         handles.push(tokio::spawn(async move {

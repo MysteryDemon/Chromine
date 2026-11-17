@@ -86,7 +86,7 @@
   }
 }
 
-.pypen-theme {
+.login-theme {
   --background: oklch(0 0 0);
   --foreground: oklch(0.96 0 0);
   --card: oklch(0.13 0 0);
@@ -111,10 +111,10 @@
   font-family: var(--font-geist-sans);
   font-feature-settings: normal;
 }
-.pypen-theme button:not(:disabled),
-.pypen-theme [role="button"]:not(:disabled) {
+.login-theme button:not(:disabled),
+.login-theme [role="button"]:not(:disabled) {
   cursor: pointer;
 }
-.pypen-theme ::selection {
+.login-theme ::selection {
   background: oklch(0.765 0.177 163.223 / 30%);
 }

@@ -38,6 +38,8 @@ pub struct JobCounts {
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Job {
     pub id: String,
+    #[serde(skip)]
+    pub owner: String,
     pub download_guid: String,
     pub source: String,
     pub source_url: Option<String>,
@@ -110,6 +112,7 @@ impl Job {
 
 pub struct NewJob {
     pub id: String,
+    pub owner: String,
     pub download_guid: String,
     pub source: String,
     pub source_url: Option<String>,
@@ -139,6 +142,7 @@ pub struct Db {
 #[derive(Debug, Clone, FromRow)]
 pub struct SessionRow {
     pub username: String,
+    pub owner: String,
     pub csrf_token: String,
     pub expires_at: i64,
     pub last_seen_at: i64,
@@ -148,9 +152,27 @@ pub struct NewSession<'a> {
     pub id_hash: &'a str,
     pub public_id: &'a str,
     pub username: &'a str,
+    pub owner: &'a str,
     pub csrf: &'a str,
     pub ip: &'a str,
     pub user_agent: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct UserRow {
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct UserInfo {
+    pub id: String,
+    pub username: String,
+    pub created_at: i64,
+    pub sessions: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -182,13 +204,14 @@ impl Db {
 
     pub async fn insert_claiming(&self, j: &NewJob, now: i64) -> Result<bool> {
         let r = sqlx::query(
-            "INSERT INTO jobs (id, download_guid, source, source_url, original_filename, chrome_filename, size_bytes,
+            "INSERT INTO jobs (id, owner, download_guid, source, source_url, original_filename, chrome_filename, size_bytes,
                 file_dev, file_ino, incoming_path, staged_path, download_completed_at, created_at, updated_at,
                 file_state, upload_state, cleanup_state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claiming', 'waiting', 'waiting')
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claiming', 'waiting', 'waiting')
              ON CONFLICT(download_guid) DO NOTHING",
         )
         .bind(&j.id)
+        .bind(&j.owner)
         .bind(&j.download_guid)
         .bind(&j.source)
         .bind(&j.source_url)
@@ -225,37 +248,54 @@ impl Db {
             .await?)
     }
 
-    pub async fn list_page(&self, limit: i64, offset: i64) -> Result<Vec<Job>> {
-        Ok(sqlx::query_as::<_, Job>("SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?)
+    pub async fn list_page(&self, owner: &str, limit: i64, offset: i64) -> Result<Vec<Job>> {
+        Ok(sqlx::query_as::<_, Job>(
+            "SELECT * FROM jobs WHERE owner = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(owner)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
-    pub async fn counts(&self) -> Result<JobCounts> {
+    pub async fn counts(&self, owner: &str) -> Result<JobCounts> {
         let (total, uploaded, active, attention, clearable) = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             "SELECT COUNT(*), \
              COALESCE(SUM(upload_state = 'uploaded'), 0), \
              COALESCE(SUM(upload_state IN ('pending', 'uploading', 'finalizing', 'retry_wait')), 0), \
              COALESCE(SUM(upload_state = 'failed' OR cleanup_state = 'failed' OR file_state = 'missing'), 0), \
              COALESCE(SUM(upload_state = 'uploaded' AND file_state IN ('deleted', 'missing')), 0) \
-             FROM jobs",
+             FROM jobs WHERE owner = ?",
         )
+        .bind(owner)
         .fetch_one(&self.pool)
         .await?;
         Ok(JobCounts { total, uploaded, active, attention, clearable })
     }
 
-    pub async fn clear_finished(&self) -> Result<u64> {
-        Ok(sqlx::query("DELETE FROM jobs WHERE upload_state = 'uploaded' AND file_state IN ('deleted', 'missing')")
-            .execute(&self.pool)
-            .await?
-            .rows_affected())
+    pub async fn clear_finished(&self, owner: &str) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM jobs WHERE owner = ? AND upload_state = 'uploaded' AND file_state IN ('deleted', 'missing')",
+        )
+        .bind(owner)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
-    pub async fn claiming_jobs(&self) -> Result<Vec<Job>> {
-        Ok(sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE file_state = 'claiming'").fetch_all(&self.pool).await?)
+    pub async fn delete_jobs_of(&self, owner: &str) -> Result<Vec<Job>> {
+        Ok(sqlx::query_as::<_, Job>("DELETE FROM jobs WHERE owner = ? RETURNING *")
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    pub async fn claiming_jobs(&self, owner: &str) -> Result<Vec<Job>> {
+        Ok(sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE owner = ? AND file_state = 'claiming'")
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     pub async fn mark_staged(&self, id: &str, upload: bool, now: i64) -> Result<()> {
@@ -573,12 +613,13 @@ impl Db {
 
     pub async fn create_session(&self, s: &NewSession<'_>, now: i64, expires_at: i64) -> Result<()> {
         sqlx::query(
-            "INSERT INTO sessions (id_hash, public_id, username, csrf_token, ip, user_agent, created_at, expires_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions (id_hash, public_id, username, owner, csrf_token, ip, user_agent, created_at, expires_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id_hash)
         .bind(s.public_id)
         .bind(s.username)
+        .bind(s.owner)
         .bind(s.csrf)
         .bind(s.ip)
         .bind(s.user_agent)
@@ -590,41 +631,111 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_sessions(&self, now: i64) -> Result<Vec<SessionInfo>> {
+    pub async fn list_sessions(&self, owner: &str, now: i64) -> Result<Vec<SessionInfo>> {
         Ok(sqlx::query_as::<_, SessionInfo>(
             "SELECT id_hash, public_id, ip, user_agent, created_at, last_seen_at FROM sessions
-             WHERE expires_at > ? AND public_id IS NOT NULL ORDER BY last_seen_at DESC",
+             WHERE owner = ? AND expires_at > ? AND public_id IS NOT NULL ORDER BY last_seen_at DESC",
         )
+        .bind(owner)
         .bind(now)
         .fetch_all(&self.pool)
         .await?)
     }
 
-    pub async fn delete_session_by_public_id(&self, public_id: &str) -> Result<bool> {
-        let r = sqlx::query("DELETE FROM sessions WHERE public_id = ?").bind(public_id).execute(&self.pool).await?;
+    pub async fn delete_session_by_public_id(&self, owner: &str, public_id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM sessions WHERE owner = ? AND public_id = ?")
+            .bind(owner)
+            .bind(public_id)
+            .execute(&self.pool)
+            .await?;
         Ok(r.rows_affected() == 1)
     }
 
-    pub async fn delete_other_sessions(&self, keep_id_hash: &str) -> Result<u64> {
-        Ok(sqlx::query("DELETE FROM sessions WHERE id_hash != ?")
+    pub async fn delete_other_sessions(&self, owner: &str, keep_id_hash: &str) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM sessions WHERE owner = ? AND id_hash != ?")
+            .bind(owner)
             .bind(keep_id_hash)
             .execute(&self.pool)
             .await?
             .rows_affected())
     }
 
-    pub async fn delete_all_sessions(&self) -> Result<u64> {
-        Ok(sqlx::query("DELETE FROM sessions").execute(&self.pool).await?.rows_affected())
+    pub async fn delete_sessions_of(&self, owner: &str) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM sessions WHERE owner = ?").bind(owner).execute(&self.pool).await?.rows_affected())
     }
 
     pub async fn get_session(&self, id_hash: &str, now: i64) -> Result<Option<SessionRow>> {
         Ok(sqlx::query_as::<_, SessionRow>(
-            "SELECT username, csrf_token, expires_at, last_seen_at FROM sessions WHERE id_hash = ? AND expires_at > ?",
+            "SELECT s.username, s.owner, s.csrf_token, s.expires_at, s.last_seen_at FROM sessions s
+             WHERE s.id_hash = ? AND s.expires_at > ?
+               AND (s.owner = '' OR EXISTS (SELECT 1 FROM users u WHERE u.id = s.owner AND u.username = s.username))",
         )
         .bind(id_hash)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    pub async fn create_user(&self, u: &UserRow) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(username) DO NOTHING",
+        )
+        .bind(&u.id)
+        .bind(&u.username)
+        .bind(&u.password_hash)
+        .bind(u.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn user_by_name(&self, username: &str) -> Result<Option<UserRow>> {
+        Ok(sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    pub async fn list_users(&self, now: i64) -> Result<Vec<UserInfo>> {
+        Ok(sqlx::query_as::<_, UserInfo>(
+            "SELECT u.id, u.username, u.created_at,
+                (SELECT COUNT(*) FROM sessions s WHERE s.owner = u.id AND s.expires_at > ?) AS sessions,
+                (SELECT MAX(s.last_seen_at) FROM sessions s WHERE s.owner = u.id) AS last_seen_at
+             FROM users u ORDER BY u.username",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn user_ids(&self, now: i64) -> Result<(Vec<String>, Vec<String>)> {
+        let rows = sqlx::query_as::<_, (String, bool)>(
+            "SELECT u.id, EXISTS (SELECT 1 FROM sessions s WHERE s.owner = u.id AND s.expires_at > ?)
+             FROM users u ORDER BY u.id",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        let active = rows.iter().filter(|r| r.1).map(|r| r.0.clone()).collect();
+        Ok((rows.into_iter().map(|r| r.0).collect(), active))
+    }
+
+    pub async fn set_user_password(&self, id: &str, password_hash: &str) -> Result<bool> {
+        let r = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+            .bind(password_hash)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn delete_user(&self, id: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let r = sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM sessions WHERE owner = ?").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(r.rows_affected() == 1)
     }
 
     pub async fn touch_session(&self, id_hash: &str, now: i64) -> Result<()> {

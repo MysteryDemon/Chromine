@@ -737,6 +737,9 @@ mod tests {
             links_dir: "/code-links".into(),
             monitor_state_file: dir.join("monitor.json"),
             start_urls: vec![],
+            scale_file: "/vnc/display-scale".into(),
+            users_dir: "/users".into(),
+            user: None,
         }
     }
 

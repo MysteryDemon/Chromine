@@ -17,7 +17,7 @@ import {
   type DeviceMode,
   type DisplayView,
 } from "@/lib/api";
-import { AlertList } from "./alerts";
+import { AlertList, browserStarting } from "./alerts";
 import { BrowserPanel } from "./browser-panel";
 import { CodePanel, codeUrl } from "./code-panel";
 import { SettingsPanel } from "./settings-panel";
@@ -67,6 +67,7 @@ function readSound(): boolean {
 
 export function Dashboard() {
   const [user, setUser] = useState<string | null>(null);
+  const [admin, setAdmin] = useState(false);
   const [display, setDisplay] = useState<DisplayView | null>(null);
   const [deviceMode, setDeviceMode] = useState<DeviceMode>("default");
   const [state, setState] = useState<DashboardState | null>(null);
@@ -76,6 +77,7 @@ export function Dashboard() {
   const [codeOpened, setCodeOpened] = useState(false);
   const [vncKey, setVncKey] = useState(0);
   const [sound, setSound] = useState(false);
+  const [openedAt] = useState(() => Date.now());
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const page = useRef(1);
   const lastLink = useRef<number | null>(null);
@@ -136,6 +138,7 @@ export function Dashboard() {
         setDisplay(s.display);
         setCode(s.code);
         setUser(s.user);
+        setAdmin(s.admin);
         return refresh().then(schedule);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -201,11 +204,13 @@ export function Dashboard() {
   const codeSrc = code ? codeUrl(code) : null;
   const shownTab: Tab = tab === "code" && !code ? "browser" : tab;
   const mode = deviceMode === "default" ? display.stream_mode : deviceMode;
+  const starting = state ? browserStarting(state, openedAt) : false;
 
   return (
     <Tabs value={shownTab} onValueChange={changeTab} className="flex h-dvh flex-col gap-0 bg-black">
       <TopBar
         state={state}
+        starting={starting}
         activeCount={activeCount}
         codeSrc={codeSrc}
         showCodeLink={shownTab === "code"}
@@ -214,7 +219,7 @@ export function Dashboard() {
         sound={sound}
         onSound={toggleSound}
       />
-      <AlertList state={state} connectionError={error} />
+      <AlertList state={state} starting={starting} connectionError={error} />
       <main className="min-h-0 flex-1">
         <TabsContent value="browser" forceMount className="h-full data-[state=inactive]:hidden">
           <BrowserPanel active={shownTab === "browser"} reloadKey={vncKey} sound={sound} display={display} mode={mode} />
@@ -229,6 +234,7 @@ export function Dashboard() {
         </TabsContent>
         <TabsContent value="settings" forceMount className="h-full overflow-y-auto overscroll-y-contain data-[state=inactive]:hidden">
           <SettingsPanel
+            admin={admin}
             active={shownTab === "settings"}
             onDisplay={updateDisplay}
             deviceMode={deviceMode}

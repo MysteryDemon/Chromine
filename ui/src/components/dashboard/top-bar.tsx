@@ -1,6 +1,21 @@
 "use client";
 
-import { ArrowDownToLine, ArrowDownUp, CodeXml, ExternalLink, Globe, RefreshCw, Settings, Volume2, VolumeX } from "lucide-react";
+import { useSyncExternalStore } from "react";
+import {
+  ArrowDownToLine,
+  ArrowDownUp,
+  CodeXml,
+  ExternalLink,
+  Globe,
+  LoaderCircle,
+  Maximize,
+  Minimize,
+  RefreshCw,
+  Settings,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -13,15 +28,15 @@ import { Pill } from "./state-badge";
 const TRIGGER =
   "group/trigger h-7 flex-none gap-1.5 rounded-full border-0 px-3.5 text-[13px] font-medium text-white/55 transition-colors hover:text-white data-[state=active]:bg-white data-[state=active]:text-black data-[state=active]:shadow-[0_1px_3px_rgba(0,0,0,0.5)] dark:text-white/55 dark:hover:text-white dark:data-[state=active]:border-transparent dark:data-[state=active]:bg-white dark:data-[state=active]:text-black [&_svg:not([class*='size-'])]:size-3.5";
 
-function StatusChips({ state }: { state: DashboardState | null }) {
+function StatusChips({ state, starting }: { state: DashboardState | null; starting: boolean }) {
   if (!state) return null;
   const b = state.browser;
-  const offline = b.stale || !b.status;
-  const stopped = !offline && !b.status?.chrome_running;
+  const offline = !starting && (b.stale || !b.status);
+  const stopped = !starting && !offline && !b.status?.chrome_running;
   const downloading = b.stale ? [] : (b.status?.active_downloads ?? []);
   const received = downloading.reduce((n, dl) => n + dl.received_bytes, 0);
   const total = downloading.reduce((n, dl) => n + dl.total_bytes, 0);
-  if (!offline && !stopped && downloading.length === 0) return null;
+  if (!offline && !stopped && !starting && downloading.length === 0) return null;
   return (
     <div
       className={cn(
@@ -30,6 +45,13 @@ function StatusChips({ state }: { state: DashboardState | null }) {
       )}
     >
       <div className="-mx-3 flex items-center gap-1.5 overflow-x-auto px-3 [scrollbar-width:none] md:mx-0 md:px-0">
+        {starting ? (
+          <span className="max-md:hidden">
+            <Pill tone="info" icon={LoaderCircle} spin>
+              Starting browser
+            </Pill>
+          </span>
+        ) : null}
         {offline || stopped ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -76,9 +98,26 @@ function StatusChips({ state }: { state: DashboardState | null }) {
 }
 
 const LABEL = "hidden sm:inline group-data-[state=active]/trigger:inline";
+const NARROW_LABEL = "hidden sm:inline min-[25rem]:group-data-[state=active]/trigger:inline";
+
+function subscribeFullscreen(onChange: () => void) {
+  document.addEventListener("fullscreenchange", onChange);
+  return () => document.removeEventListener("fullscreenchange", onChange);
+}
+
+function useFullscreen() {
+  const supported = useSyncExternalStore(subscribeFullscreen, () => document.fullscreenEnabled === true, () => false);
+  const active = useSyncExternalStore(subscribeFullscreen, () => !!document.fullscreenElement, () => false);
+  function toggle() {
+    const change = document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+    change.catch(() => toast.error("The browser blocked full screen"));
+  }
+  return { supported, active, toggle };
+}
 
 export function TopBar({
   state,
+  starting,
   activeCount,
   codeSrc,
   showCodeLink,
@@ -88,6 +127,7 @@ export function TopBar({
   onSound,
 }: {
   state: DashboardState | null;
+  starting: boolean;
   activeCount: number;
   codeSrc: string | null;
   showCodeLink: boolean;
@@ -96,23 +136,25 @@ export function TopBar({
   sound: boolean;
   onSound: () => void;
 }) {
+  const fullscreen = useFullscreen();
+  const label = codeSrc && fullscreen.supported ? NARROW_LABEL : LABEL;
   return (
     <header className="sticky top-0 z-30 border-b border-white/[0.06] bg-black">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2.5 px-3 py-2.5 sm:px-5 md:h-14 md:flex-nowrap md:py-0">
         <TabsList className="h-9 shrink-0 gap-0.5 rounded-full bg-white/[0.04] p-1 ring-1 ring-white/[0.07]">
           <TabsTrigger value="browser" className={TRIGGER} aria-label="Browser">
             <Globe aria-hidden />
-            <span className={LABEL}>Browser</span>
+            <span className={label}>Browser</span>
           </TabsTrigger>
           {codeSrc ? (
             <TabsTrigger value="code" className={TRIGGER} aria-label="VS Code">
               <CodeXml aria-hidden />
-              <span className={LABEL}>VS Code</span>
+              <span className={label}>VS Code</span>
             </TabsTrigger>
           ) : null}
           <TabsTrigger value="transfers" className={TRIGGER} aria-label="Transfers">
             <ArrowDownUp aria-hidden />
-            <span className={LABEL}>Transfers</span>
+            <span className={label}>Transfers</span>
             {activeCount > 0 ? (
               <span className="ml-0.5 inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-info/15 px-1 text-[10px] font-semibold text-info tabular-nums group-data-[state=active]/trigger:bg-black group-data-[state=active]/trigger:text-white">
                 {activeCount}
@@ -121,13 +163,13 @@ export function TopBar({
           </TabsTrigger>
           <TabsTrigger value="settings" className={TRIGGER} aria-label="Settings">
             <Settings aria-hidden />
-            <span className={LABEL}>Settings</span>
+            <span className={label}>Settings</span>
           </TabsTrigger>
         </TabsList>
 
-        <StatusChips state={state} />
+        <StatusChips state={state} starting={starting} />
 
-        <div className={cn("ml-auto flex items-center gap-2", !showReconnect && !showCodeLink && "hidden md:flex")}>
+        <div className={cn("ml-auto flex items-center gap-2", !showReconnect && !showCodeLink && !fullscreen.supported && "hidden md:flex")}>
           {showCodeLink && codeSrc ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -181,6 +223,22 @@ export function TopBar({
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Reload the remote browser display</TooltipContent>
+            </Tooltip>
+          ) : null}
+          {fullscreen.supported ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={fullscreen.toggle}
+                  aria-label={fullscreen.active ? "Exit full screen" : "Full screen"}
+                  className="size-9 rounded-full bg-white/[0.04] text-white/75 ring-1 ring-white/[0.08] hover:bg-white/[0.09] hover:text-white dark:hover:bg-white/[0.09]"
+                >
+                  {fullscreen.active ? <Minimize aria-hidden /> : <Maximize aria-hidden />}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{fullscreen.active ? "Exit full screen" : "Full screen"}</TooltipContent>
             </Tooltip>
           ) : null}
         </div>

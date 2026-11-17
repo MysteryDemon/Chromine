@@ -18,6 +18,7 @@ use crate::settings::Live;
 #[derive(Clone)]
 pub struct Ingest {
     pub db: Db,
+    pub owner: String,
     pub incoming: PathBuf,
     pub completed: PathBuf,
     pub jobs_dir: PathBuf,
@@ -128,6 +129,7 @@ impl Ingest {
         let staged = self.staged_path(&id);
         let job = NewJob {
             id: id.clone(),
+            owner: self.owner.clone(),
             download_guid: rec.guid.clone(),
             source: match rec.source {
                 chromine_shared::RecordSource::Extension => "extension".into(),
@@ -182,7 +184,7 @@ impl Ingest {
     }
 
     pub async fn recover_claims(&self) -> Result<()> {
-        for job in self.db.claiming_jobs().await? {
+        for job in self.db.claiming_jobs(&self.owner).await? {
             let staged = PathBuf::from(&job.staged_path);
             let incoming = PathBuf::from(&job.incoming_path);
             let matches = |p: &Path| {
@@ -266,6 +268,7 @@ impl Ingest {
         let staged = self.staged_path(&id);
         let job = NewJob {
             id: id.clone(),
+            owner: self.owner.clone(),
             download_guid: format!("manual-{}", uuid::Uuid::new_v4()),
             source: "manual".into(),
             source_url: None,

@@ -38,7 +38,7 @@ pub fn router(st: Shared) -> Router {
 }
 
 async fn open_js(State(st): State<Shared>, jar: CookieJar) -> Response {
-    if authenticate(&st, &jar).await.is_none() {
+    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     (
@@ -64,7 +64,7 @@ pub fn web_link(raw: &str) -> Option<String> {
 }
 
 async fn open_link(State(st): State<Shared>, jar: CookieJar, headers: HeaderMap, body: Bytes) -> Response {
-    if authenticate(&st, &jar).await.is_none() {
+    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !same_origin(&st, &headers) {
@@ -144,7 +144,7 @@ async fn proxy(State(st): State<Shared>, jar: CookieJar, mut req: Request) -> Re
     let Some(socket) = st.cfg.code_socket.clone() else {
         return page(StatusCode::NOT_FOUND, "VS Code", "VS Code is not set up on this server.");
     };
-    if authenticate(&st, &jar).await.is_none() {
+    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
         return page(
             StatusCode::UNAUTHORIZED,
             "Sign in",

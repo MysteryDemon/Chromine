@@ -6,7 +6,13 @@ import { cn } from "@/lib/utils";
 
 type Item = { key: string; tone: "bad" | "warn"; icon: React.ElementType; title: string; text?: string };
 
-export function collectAlerts(st: DashboardState): Item[] {
+export function browserStarting(st: DashboardState, openedAt: number): boolean {
+  const s = st.browser.status;
+  if (st.browser.stale || !s) return Date.now() - openedAt < 20_000;
+  return !s.chrome_running && s.chrome_starts === 0 && !s.last_error;
+}
+
+export function collectAlerts(st: DashboardState, starting = false): Item[] {
   const out: Item[] = [];
   const d = st.disk;
   if (d.low) {
@@ -22,7 +28,7 @@ export function collectAlerts(st: DashboardState): Item[] {
     out.push({ key: "https", tone: "bad", icon: ShieldAlert, title: "HTTPS certificate not issued", text: st.https.error });
   }
   const b = st.browser;
-  if (b.stale || !b.status) {
+  if ((b.stale || !b.status) && !starting) {
     out.push({
       key: "agent",
       tone: "bad",
@@ -30,7 +36,7 @@ export function collectAlerts(st: DashboardState): Item[] {
       title: "The browser service is not reporting",
       text: "Check `docker compose ps` and `docker compose logs browser`.",
     });
-  } else {
+  } else if (b.status && !b.stale) {
     const s = b.status;
     if (s.sandbox_ok === false) {
       out.push({ key: "sandbox", tone: "bad", icon: ShieldAlert, title: "Chrome sandbox unavailable", text: s.sandbox_detail ?? undefined });
@@ -54,12 +60,20 @@ export function collectAlerts(st: DashboardState): Item[] {
   return out;
 }
 
-export function AlertList({ state, connectionError }: { state: DashboardState | null; connectionError: string | null }) {
+export function AlertList({
+  state,
+  starting,
+  connectionError,
+}: {
+  state: DashboardState | null;
+  starting: boolean;
+  connectionError: string | null;
+}) {
   const items: Item[] = [];
   if (connectionError) {
     items.push({ key: "conn", tone: "bad", icon: WifiOff, title: "Cannot reach the server", text: connectionError });
   }
-  if (state) items.push(...collectAlerts(state));
+  if (state) items.push(...collectAlerts(state, starting));
   if (!items.length) return null;
   return (
     <div className="grid gap-2 px-3 pt-3 sm:px-5">

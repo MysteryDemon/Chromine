@@ -3,11 +3,11 @@
 import "@fontsource-variable/space-grotesk"
 import { useState, type FormEvent } from "react"
 import { CircleAlert, LoaderCircle, Lock, LogIn, User } from "lucide-react"
-import { Alert, AlertDescription } from "@/components/pypen/alert"
-import { Button } from "@/components/pypen/button"
-import { Card } from "@/components/pypen/card"
-import { Input } from "@/components/pypen/input"
-import { Label } from "@/components/pypen/label"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import { Card } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { login } from "@/lib/api"
 
 function nextPath(): string {
@@ -79,7 +79,7 @@ export default function LoginPage() {
                 />
               </div>
             </div>
-            <Button type="submit" size="lg" className="h-10" disabled={pending}>
+            <Button type="submit" size="lg" className="h-10 rounded-lg" disabled={pending}>
               {pending ? <LoaderCircle className="animate-spin" /> : <LogIn />}
               {pending ? "Signing in…" : "Sign in"}
             </Button>

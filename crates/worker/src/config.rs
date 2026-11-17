@@ -311,14 +311,41 @@ impl Config {
         Ok(cfg)
     }
 
+    pub fn space_dir(&self, owner: &str) -> PathBuf {
+        if owner.is_empty() { self.download_dir.clone() } else { chromine_shared::user_dir(&self.download_dir, owner) }
+    }
     pub fn incoming_dir(&self) -> PathBuf {
-        self.download_dir.join(chromine_shared::INCOMING_SUBDIR)
+        self.incoming_dir_of("")
     }
     pub fn completed_dir(&self) -> PathBuf {
-        self.download_dir.join(chromine_shared::EVENTS_SUBDIR).join(chromine_shared::COMPLETED_SUBDIR)
+        self.completed_dir_of("")
     }
-    pub fn agent_status_file(&self) -> PathBuf {
-        self.download_dir.join(chromine_shared::EVENTS_SUBDIR).join(chromine_shared::AGENT_STATUS_FILE)
+    pub fn incoming_dir_of(&self, owner: &str) -> PathBuf {
+        self.space_dir(owner).join(chromine_shared::INCOMING_SUBDIR)
+    }
+    pub fn completed_dir_of(&self, owner: &str) -> PathBuf {
+        self.space_dir(owner).join(chromine_shared::EVENTS_SUBDIR).join(chromine_shared::COMPLETED_SUBDIR)
+    }
+    pub fn agent_status_file(&self, owner: &str) -> PathBuf {
+        self.space_dir(owner).join(chromine_shared::EVENTS_SUBDIR).join(chromine_shared::AGENT_STATUS_FILE)
+    }
+    pub fn vnc_root(&self) -> PathBuf {
+        self.vnc_socket.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    }
+    pub fn vnc_socket_of(&self, owner: &str) -> PathBuf {
+        if owner.is_empty() {
+            return self.vnc_socket.clone();
+        }
+        chromine_shared::user_dir(&self.vnc_root(), owner).join(chromine_shared::VNC_SOCKET_NAME)
+    }
+    pub fn audio_socket_of(&self, owner: &str) -> PathBuf {
+        if owner.is_empty() {
+            return self.audio_socket.clone();
+        }
+        chromine_shared::user_dir(&self.vnc_root(), owner).join(chromine_shared::AUDIO_SOCKET_NAME)
+    }
+    pub fn users_file(&self) -> PathBuf {
+        self.vnc_root().join(chromine_shared::USERS_FILE)
     }
     pub fn jobs_dir(&self) -> PathBuf {
         self.download_dir.join(chromine_shared::JOBS_SUBDIR)

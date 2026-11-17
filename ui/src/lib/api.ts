@@ -154,9 +154,18 @@ export interface CodeView {
 
 export interface Session {
   user: string;
+  admin: boolean;
   csrf: string;
   display: DisplayView;
   code: CodeView | null;
+}
+
+export interface UserInfo {
+  id: string;
+  username: string;
+  created_at: number;
+  sessions: number;
+  last_seen_at: number | null;
 }
 
 export class ApiError extends Error {
@@ -215,6 +224,14 @@ export const getSessions = () => request<{ sessions: SessionInfo[] }>("GET", "/a
 export const logoutSession = (id: string) =>
   request<{ logged_out: boolean }>("POST", `/api/sessions/${encodeURIComponent(id)}/logout`);
 export const logoutOtherSessions = () => request<{ logged_out: number }>("POST", "/api/sessions/logout-others");
+export const getUsers = () => request<{ users: UserInfo[]; min_password: number }>("GET", "/api/users");
+export const createUser = (username: string, password: string) =>
+  request<{ id: string; username: string }>("POST", "/api/users", { username, password });
+export const setUserPassword = (id: string, password: string) =>
+  request<{ ok: boolean }>("POST", `/api/users/${encodeURIComponent(id)}/password`, { password });
+export const logoutUser = (id: string) =>
+  request<{ logged_out: number }>("POST", `/api/users/${encodeURIComponent(id)}/logout`);
+export const deleteUser = (id: string) => request<{ deleted: boolean }>("POST", `/api/users/${encodeURIComponent(id)}/delete`);
 
 export async function login(username: string, password: string): Promise<void> {
   const res = await fetch("/login", {

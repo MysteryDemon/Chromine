@@ -116,7 +116,7 @@ RUN groupadd --gid 10000 chromine \
  && useradd --uid 10001 --gid 10000 --no-create-home --home-dir /tmp/chrome-home --shell /usr/sbin/nologin chrome \
  && install -d -o 10001 -g 10000 -m 2770 /downloads /downloads/incoming /downloads/events /downloads/events/completed /downloads/video \
  && install -d -o 10002 -g 10000 -m 0700 /downloads/jobs \
- && install -d -o 10001 -g 10000 -m 0700 /profile \
+ && install -d -o 10001 -g 10000 -m 0700 /profile /users \
  && install -d -o 10001 -g 10000 -m 2770 /vnc /code-links
 
 COPY --from=build /usr/local/bin/chromine-agent /usr/local/bin/chromine-agent
@@ -128,11 +128,12 @@ ENV DOWNLOAD_DIR=/downloads \
     HOME=/tmp/chrome-home \
     XDG_RUNTIME_DIR=/tmp/chrome-runtime \
     VNC_SOCKET=/vnc/vnc.sock \
+    USERS_DIR=/users \
     VIDEO_DIR=/tmp/chromine-video \
     YTDLP_BIN=/usr/local/bin/yt-dlp \
     LANG=C.UTF-8
 
 USER 10001:10000
-VOLUME ["/profile", "/downloads", "/vnc", "/code-links"]
+VOLUME ["/profile", "/users", "/downloads", "/vnc", "/code-links"]
 ENTRYPOINT ["/usr/local/bin/chromine-agent"]
 CMD ["run"]

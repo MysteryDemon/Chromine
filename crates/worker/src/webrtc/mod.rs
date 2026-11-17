@@ -2,7 +2,7 @@ pub mod capture;
 pub mod media;
 pub mod rfb;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,12 +32,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const OPUS_FRAME: u64 = 960;
 const MAX_QUEUED_BYTES: usize = 16 << 20;
 
+#[derive(Clone)]
 pub struct Settings {
     pub vnc_socket: PathBuf,
     pub audio_socket: PathBuf,
     pub ffmpeg: PathBuf,
     pub port: u16,
     pub live: watch::Receiver<Live>,
+}
+
+pub struct Screen {
+    pub key: String,
+    pub vnc_socket: PathBuf,
+    pub audio_socket: PathBuf,
 }
 
 pub enum Feed {
@@ -54,7 +61,7 @@ pub struct Joined {
 }
 
 enum Request {
-    Join { offer: SdpOffer, candidate: SocketAddr, reply: oneshot::Sender<Result<Joined>> },
+    Join { offer: SdpOffer, candidate: SocketAddr, screen: Box<Screen>, reply: oneshot::Sender<Result<Joined>> },
     Leave(u64),
 }
 
@@ -83,22 +90,21 @@ impl Hub {
             outbox: Outbox::default(),
             sessions: Vec::new(),
             next_id: 1,
-            capture: None,
-            audio: None,
-            codecs: BTreeSet::new(),
+            screens: HashMap::new(),
             feed_tx,
             epoch: Instant::now(),
-            audio_clock: None,
-            cursor: None,
         };
         tokio::spawn(hub.run(rx, feed_rx));
         tracing::info!(port, "WebRTC streaming ready");
         Ok(Hub { tx, port })
     }
 
-    pub async fn join(&self, offer: SdpOffer, candidate: SocketAddr) -> Result<Joined> {
+    pub async fn join(&self, offer: SdpOffer, candidate: SocketAddr, screen: Screen) -> Result<Joined> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(Request::Join { offer, candidate, reply }).await.map_err(|_| anyhow!("streaming stopped"))?;
+        self.tx
+            .send(Request::Join { offer, candidate, screen: Box::new(screen), reply })
+            .await
+            .map_err(|_| anyhow!("streaming stopped"))?;
         rx.await.map_err(|_| anyhow!("streaming stopped"))?
     }
 
@@ -109,6 +115,7 @@ impl Hub {
 
 struct Session {
     id: u64,
+    screen: String,
     rtc: Rtc,
     video: Option<(Mid, Pt, Codec)>,
     audio: Option<(Mid, Pt)>,
@@ -128,13 +135,54 @@ struct State {
     outbox: Outbox,
     sessions: Vec<Session>,
     next_id: u64,
+    screens: HashMap<String, Display>,
+    feed_tx: mpsc::Sender<(String, Feed)>,
+    epoch: Instant,
+}
+
+struct Display {
+    settings: Arc<Settings>,
+    feed: mpsc::Sender<Feed>,
     capture: Option<(mpsc::Sender<Command>, JoinHandle<()>)>,
     audio: Option<JoinHandle<()>>,
     codecs: BTreeSet<Codec>,
-    feed_tx: mpsc::Sender<Feed>,
-    epoch: Instant,
     audio_clock: Option<(u64, Instant)>,
     cursor: Option<String>,
+}
+
+impl Display {
+    fn new(base: &Settings, screen: Screen, hub: &mpsc::Sender<(String, Feed)>) -> Display {
+        let settings =
+            Arc::new(Settings { vnc_socket: screen.vnc_socket, audio_socket: screen.audio_socket, ..base.clone() });
+        let (feed, mut rx) = mpsc::channel::<Feed>(256);
+        let out = hub.clone();
+        let key = screen.key;
+        tokio::spawn(async move {
+            while let Some(f) = rx.recv().await {
+                if out.send((key.clone(), f)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Display { settings, feed, capture: None, audio: None, codecs: BTreeSet::new(), audio_clock: None, cursor: None }
+    }
+
+    fn stop(&mut self) {
+        if let Some((_, task)) = self.capture.take() {
+            task.abort();
+        }
+        if let Some(task) = self.audio.take() {
+            task.abort();
+        }
+        self.codecs.clear();
+        self.audio_clock = None;
+    }
+
+    fn command(&self, c: Command) {
+        if let Some((tx, _)) = &self.capture {
+            let _ = tx.try_send(c);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -213,18 +261,20 @@ fn pick_video(choice: WebrtcCodec, params: &[(Pt, RtcCodec, bool)]) -> Option<(P
 }
 
 impl State {
-    async fn run(mut self, mut requests: mpsc::Receiver<Request>, mut feed: mpsc::Receiver<Feed>) {
+    async fn run(mut self, mut requests: mpsc::Receiver<Request>, mut feed: mpsc::Receiver<(String, Feed)>) {
         let mut buf = vec![0u8; 2048];
         loop {
             let deadline = self.drive();
             self.tidy();
             tokio::select! {
                 r = requests.recv() => match r {
-                    Some(Request::Join { offer, candidate, reply }) => { let _ = reply.send(self.join(offer, candidate)); }
+                    Some(Request::Join { offer, candidate, screen, reply }) => {
+                        let _ = reply.send(self.join(offer, candidate, *screen));
+                    }
                     Some(Request::Leave(id)) => self.sessions.retain(|s| s.id != id),
                     None => return,
                 },
-                Some(f) = feed.recv() => self.deliver(f),
+                Some((key, f)) = feed.recv() => self.deliver(&key, f),
                 r = self.socket.recv_from(&mut buf) => {
                     let Ok((n, source)) = r else { continue };
                     let Ok(contents) = buf[..n].try_into() else { continue };
@@ -261,8 +311,8 @@ impl State {
         }
     }
 
-    fn join(&mut self, offer: SdpOffer, candidate: SocketAddr) -> Result<Joined> {
-        if self.sessions.len() >= MAX_VIEWERS {
+    fn join(&mut self, offer: SdpOffer, candidate: SocketAddr, screen: Screen) -> Result<Joined> {
+        if self.sessions.iter().filter(|s| s.screen == screen.key).count() >= MAX_VIEWERS {
             bail!("too many viewers are connected");
         }
         let mut rtc = rtc_for(self.codec);
@@ -271,8 +321,11 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
         let (closed_tx, closed) = oneshot::channel();
+        let key = screen.key.clone();
+        self.screens.entry(key.clone()).or_insert_with(|| Display::new(&self.settings, screen, &self.feed_tx));
         self.sessions.push(Session {
             id,
+            screen: key,
             rtc,
             video: None,
             audio: None,
@@ -288,8 +341,10 @@ impl State {
 
     fn drive(&mut self) -> Instant {
         let mut soonest = Instant::now() + Duration::from_secs(1);
-        let mut commands = Vec::new();
+        let mut commands: Vec<(String, Command)> = Vec::new();
         for s in &mut self.sessions {
+            let cursor = self.screens.get(&s.screen).and_then(|d| d.cursor.as_deref());
+            let mut mine = Vec::new();
             loop {
                 if !s.rtc.is_alive() {
                     break;
@@ -300,16 +355,19 @@ impl State {
                         break;
                     }
                     Ok(Output::Transmit(t)) => self.outbox.send(&self.socket, &t.contents, t.destination),
-                    Ok(Output::Event(e)) => s.event(e, self.codec, &mut commands, self.cursor.as_deref()),
+                    Ok(Output::Event(e)) => s.event(e, self.codec, &mut mine, cursor),
                     Err(e) => {
                         tracing::debug!(error = %e, "WebRTC viewer failed");
                         s.rtc.disconnect();
                     }
                 }
             }
+            commands.extend(mine.into_iter().map(|c| (s.screen.clone(), c)));
         }
-        for c in commands {
-            self.command(c);
+        for (key, c) in commands {
+            if let Some(d) = self.screens.get(&key) {
+                d.command(c);
+            }
         }
         soonest
     }
@@ -320,56 +378,47 @@ impl State {
         if self.sessions.len() != before {
             tracing::info!(viewers = self.sessions.len(), "WebRTC viewer left");
         }
-        let codecs: BTreeSet<Codec> =
-            self.sessions.iter().filter(|s| s.connected).filter_map(|s| s.video.map(|v| v.2)).collect();
-        let watching = self.sessions.iter().any(|s| s.connected);
-        if !watching {
-            if let Some((_, task)) = self.capture.take() {
-                task.abort();
+        let sessions = &self.sessions;
+        self.screens.retain(|key, d| {
+            let mine = || sessions.iter().filter(move |s| &s.screen == key);
+            if !mine().any(|s| s.connected) {
+                d.stop();
+                return mine().next().is_some();
             }
-            if let Some(task) = self.audio.take() {
-                task.abort();
+            if d.capture.is_none() {
+                let (tx, rx) = mpsc::channel(256);
+                let task = tokio::spawn(capture::run(d.settings.clone(), rx, d.feed.clone()));
+                d.capture = Some((tx, task));
+                d.codecs.clear();
             }
-            self.codecs.clear();
-            self.audio_clock = None;
-            return;
-        }
-        if self.capture.is_none() {
-            let (tx, rx) = mpsc::channel(256);
-            let task = tokio::spawn(capture::run(self.settings.clone(), rx, self.feed_tx.clone()));
-            self.capture = Some((tx, task));
-            self.codecs.clear();
-        }
-        if codecs != self.codecs {
-            self.codecs = codecs.clone();
-            self.command(Command::Codecs(codecs));
-        }
-        if self.audio.is_none() && self.sessions.iter().any(|s| s.connected && s.audio.is_some()) {
-            let settings = self.settings.clone();
-            let out = self.feed_tx.clone();
-            self.audio = Some(tokio::spawn(async move {
-                loop {
-                    if let Err(e) = media::stream_audio(&settings.ffmpeg, &settings.audio_socket, &out).await {
-                        tracing::debug!(error = %e, "WebRTC sound unavailable");
+            let codecs: BTreeSet<Codec> = mine().filter(|s| s.connected).filter_map(|s| s.video.map(|v| v.2)).collect();
+            if codecs != d.codecs {
+                d.codecs = codecs.clone();
+                d.command(Command::Codecs(codecs));
+            }
+            if d.audio.is_none() && mine().any(|s| s.connected && s.audio.is_some()) {
+                let settings = d.settings.clone();
+                let out = d.feed.clone();
+                d.audio = Some(tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = media::stream_audio(&settings.ffmpeg, &settings.audio_socket, &out).await {
+                            tracing::debug!(error = %e, "WebRTC sound unavailable");
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }));
-        }
+                }));
+            }
+            true
+        });
     }
 
-    fn command(&self, c: Command) {
-        if let Some((tx, _)) = &self.capture {
-            let _ = tx.try_send(c);
-        }
-    }
-
-    fn deliver(&mut self, feed: Feed) {
+    fn deliver(&mut self, key: &str, feed: Feed) {
         let now = Instant::now();
+        let Some(d) = self.screens.get_mut(key) else { return };
         match feed {
             Feed::Video { codec, data, keyframe } => {
                 let at = MediaTime::from_micros(now.duration_since(self.epoch).as_micros() as u64);
-                for s in self.sessions.iter_mut().filter(|s| s.connected) {
+                for s in self.sessions.iter_mut().filter(|s| s.connected && s.screen == key) {
                     let Some((mid, pt, c)) = s.video else { continue };
                     if c != codec || (s.waiting_keyframe && !keyframe) {
                         continue;
@@ -384,13 +433,13 @@ impl State {
             }
             Feed::Audio(packet) => {
                 let wall = now.duration_since(self.epoch).as_micros() as u64 * 48 / 1000;
-                let samples = match self.audio_clock {
+                let samples = match d.audio_clock {
                     Some((last, at)) if now.duration_since(at) < Duration::from_millis(100) => last + OPUS_FRAME,
                     _ => wall,
                 };
-                self.audio_clock = Some((samples, now));
+                d.audio_clock = Some((samples, now));
                 let at = MediaTime::new(samples, str0m::media::Frequency::FORTY_EIGHT_KHZ);
-                for s in self.sessions.iter_mut().filter(|s| s.connected) {
+                for s in self.sessions.iter_mut().filter(|s| s.connected && s.screen == key) {
                     let Some((mid, pt)) = s.audio else { continue };
                     if let Some(w) = s.rtc.writer(mid) {
                         let _ = w.write(pt, now, at, packet.clone());
@@ -407,15 +456,15 @@ impl State {
                     base64::engine::general_purpose::STANDARD.encode(&c.rgba)
                 ])
                 .to_string();
-                self.broadcast(&msg);
-                self.cursor = Some(msg);
+                d.cursor = Some(msg.clone());
+                self.broadcast(key, &msg);
             }
-            Feed::Clipboard(text) => self.broadcast(&json!(["clip", text]).to_string()),
+            Feed::Clipboard(text) => self.broadcast(key, &json!(["clip", text]).to_string()),
         }
     }
 
-    fn broadcast(&mut self, msg: &str) {
-        for s in &mut self.sessions {
+    fn broadcast(&mut self, key: &str, msg: &str) {
+        for s in self.sessions.iter_mut().filter(|s| s.screen == key) {
             if let Some(mut ch) = s.channel.and_then(|id| s.rtc.channel(id)) {
                 let _ = ch.write(false, msg.as_bytes());
             }
@@ -530,7 +579,7 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("{host} has no address"))
 }
 
-pub async fn signal(mut ws: WebSocket, hub: Hub, host: String) {
+pub async fn signal(mut ws: WebSocket, hub: Hub, host: String, screen: Screen) {
     let offer = match tokio::time::timeout(Duration::from_secs(15), ws.recv()).await {
         Ok(Some(Ok(Message::Text(t)))) => t,
         _ => return,
@@ -540,7 +589,7 @@ pub async fn signal(mut ws: WebSocket, hub: Hub, host: String) {
         let sdp = v.get("sdp").and_then(Value::as_str).context("the offer has no SDP")?;
         let offer = SdpOffer::from_sdp_string(sdp).context("the offer is not valid SDP")?;
         let addr = resolve(&host, hub.port).await.with_context(|| format!("cannot resolve {host}"))?;
-        hub.join(offer, addr).await
+        hub.join(offer, addr, screen).await
     }
     .await;
     let mut joined = match joined {
