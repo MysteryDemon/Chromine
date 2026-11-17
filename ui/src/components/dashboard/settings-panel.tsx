@@ -571,7 +571,7 @@ function UserItem({
               </AlertDialogHeader>
               <AlertDialogFooter>
                 <AlertDialogCancel className={DIALOG_CANCEL}>Cancel</AlertDialogCancel>
-                <AlertDialogAction className="rounded-full bg-destructive text-white hover:bg-destructive/85" onClick={onDelete}>
+                <AlertDialogAction className="rounded-full bg-white text-black hover:bg-white/85" onClick={onDelete}>
                   Delete user
                 </AlertDialogAction>
               </AlertDialogFooter>

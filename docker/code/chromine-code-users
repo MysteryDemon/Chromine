@@ -147,14 +147,20 @@ function start(id, uid, name) {
     CHROMINE_LINKS_DIR: links,
   };
   if (process.env.TZ) env.TZ = process.env.TZ;
-  const child = spawn("/usr/bin/code-server", [...ARGS, "--socket", socket, workspace], {
-    uid,
-    gid: uid,
-    env,
-    cwd: workspace,
-    detached: true,
-    stdio: ["ignore", "inherit", "inherit"],
-  });
+  const umask = process.umask(0o077);
+  let child;
+  try {
+    child = spawn("/usr/bin/code-server", [...ARGS, "--socket", socket, workspace], {
+      uid,
+      gid: uid,
+      env,
+      cwd: workspace,
+      detached: true,
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+  } finally {
+    process.umask(umask);
+  }
   const entry = { child, uid, stopping: false, exited: false, started: Date.now(), retryAt: 0, backoff: 2000 };
   const ended = (why) => {
     if (entry.exited) return;
