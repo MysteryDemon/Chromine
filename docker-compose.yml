@@ -127,6 +127,7 @@ services:
     volumes:
       - code-home:/root
       - code-usr-local:/usr/local
+      - code-users:/home/chromine
       - code-socket:/code-socket
       - code-links:/code-links
     stop_grace_period: 15s
@@ -150,6 +151,8 @@ volumes:
   code-usr-local:
     name: chromine_code-usr-local
     external: true
+  code-users:
+    name: chromine_code-users
   code-socket:
   code-links:
 

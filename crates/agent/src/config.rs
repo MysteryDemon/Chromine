@@ -205,6 +205,8 @@ impl AgentConfig {
             audio_socket: sockets.join(chromine_shared::AUDIO_SOCKET_NAME),
             video_dir: run.join("video"),
             monitor_state_file: run.join("monitor.json"),
+            links_dir: chromine_shared::user_dir(&self.links_dir, id),
+            scale_file: sockets.join(chromine_shared::DISPLAY_SCALE_FILE),
             start_urls: Vec::new(),
             user: Some(id.to_string()),
             ..self.clone()
@@ -217,7 +219,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_user_instance_gets_its_own_paths_and_shares_the_scale_file() {
+    fn a_user_instance_gets_its_own_paths() {
         let base = AgentConfig {
             download_dir: "/downloads".into(),
             profile_dir: "/profile".into(),
@@ -255,7 +257,8 @@ mod tests {
         assert_eq!(u.audio_socket, PathBuf::from(format!("/vnc/users/{id}/audio.sock")));
         assert_eq!(u.monitor_state_file, PathBuf::from(format!("/users/{id}/run/monitor.json")));
         assert_eq!(u.video_dir, PathBuf::from(format!("/users/{id}/run/video")));
-        assert_eq!(u.scale_file, base.scale_file);
+        assert_eq!(u.scale_file, PathBuf::from(format!("/vnc/users/{id}/display-scale")));
+        assert_eq!(u.links_dir, PathBuf::from(format!("/code-links/users/{id}")));
         assert_eq!(u.display(), ":7");
         assert_eq!(u.user.as_deref(), Some(id));
         assert_eq!(base.users_file(), PathBuf::from("/vnc/users.json"));

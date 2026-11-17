@@ -31,7 +31,7 @@ pub struct AppState {
     pub ui: Arc<crate::ui::UiAssets>,
     pub novnc: Option<Arc<crate::ui::UiAssets>>,
     pub webrtc: Option<crate::webrtc::Hub>,
-    pub settings: Arc<crate::settings::Store>,
+    pub settings: Arc<crate::settings::Registry>,
     pub cfg: Arc<Config>,
     pub db: Db,
     pub spaces: crate::users::Spaces,
@@ -403,8 +403,8 @@ async fn api_session(State(st): State<Shared>, req: Request) -> Response {
             "user": a.session.username,
             "admin": a.is_admin(),
             "csrf": a.session.csrf_token,
-            "display": display_view(&st.settings.current()),
-            "code": st.cfg.code_socket.as_ref().filter(|_| a.is_admin()).map(|_| json!({
+            "display": display_view(&st.settings.of(a.owner()).current()),
+            "code": st.cfg.code_socket.as_ref().map(|_| json!({
                 "url": st.cfg.code_public_url.as_ref().map(|u| u.as_str()),
                 "port": st.cfg.code_port,
             })),
@@ -499,20 +499,17 @@ fn display_view(l: &Live) -> serde_json::Value {
     })
 }
 
-fn settings_view(st: &AppState, values: &Live) -> Response {
+fn settings_view(st: &AppState, owner: &str, values: &Live) -> Response {
     Json(json!({
         "values": values,
-        "defaults": st.settings.defaults(),
+        "defaults": st.settings.of(owner).defaults(),
         "webrtc_ready": st.webrtc.is_some(),
     }))
     .into_response()
 }
 
 async fn api_settings(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
-    if !me.is_admin() {
-        return admin_only();
-    }
-    settings_view(&st, &st.settings.current())
+    settings_view(&st, me.owner(), &st.settings.of(me.owner()).current())
 }
 
 async fn api_save_settings(
@@ -520,27 +517,24 @@ async fn api_save_settings(
     Extension(me): Extension<Authed>,
     Json(patch): Json<serde_json::Map<String, serde_json::Value>>,
 ) -> Response {
-    if !me.is_admin() {
+    if !me.is_admin() && patch.contains_key("webrtc_host") {
         return admin_only();
     }
     let names: Vec<String> = patch.keys().cloned().collect();
-    match st.settings.update(patch).await {
+    match st.settings.of(me.owner()).update(patch).await {
         Ok(values) => {
-            tracing::info!(changed = ?names, "settings saved");
-            settings_view(&st, &values)
+            tracing::info!(changed = ?names, user = %me.owner(), "settings saved");
+            settings_view(&st, me.owner(), &values)
         }
         Err(e) => api_error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
     }
 }
 
 async fn api_reset_settings(State(st): State<Shared>, Extension(me): Extension<Authed>) -> Response {
-    if !me.is_admin() {
-        return admin_only();
-    }
-    match st.settings.reset().await {
+    match st.settings.of(me.owner()).reset().await {
         Ok(values) => {
-            tracing::info!("settings reset to defaults");
-            settings_view(&st, &values)
+            tracing::info!(user = %me.owner(), "settings reset to defaults");
+            settings_view(&st, me.owner(), &values)
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")),
     }
@@ -617,7 +611,7 @@ async fn api_state(
     };
     let progress = st.uploader.live_progress();
     let jobs: Vec<JobView> = jobs.into_iter().map(|j| job_view(j, progress.as_ref())).collect();
-    let live = st.settings.current();
+    let live = st.settings.of(&owner).current();
 
     let cfg = st.cfg.clone();
     let ingest = st.spaces.ingest(&owner);
@@ -691,7 +685,7 @@ async fn api_retry(State(st): State<Shared>, Extension(me): Extension<Authed>, P
         Err((status, msg)) => return api_error(status, msg),
     };
     if job.file_state == state::FILE_STAGED && job.upload_state == state::UP_SKIPPED {
-        if !st.settings.current().filecloud {
+        if !st.settings.of(me.owner()).current().filecloud {
             return api_error(
                 StatusCode::CONFLICT,
                 "FileCloud24 is off in Settings, so there is nowhere to send this file.",
@@ -825,7 +819,7 @@ async fn webrtc_websocket(
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "WebRTC streaming is unavailable; see the worker log");
     };
     let public = st.cfg.public_url.as_ref().and_then(|u| u.host_str().map(str::to_string));
-    let configured = st.settings.current().webrtc_host().map(str::to_string).or(public);
+    let configured = st.settings.of("").current().webrtc_host().map(str::to_string).or(public);
     let Some(host) = crate::webrtc::candidate_host(configured.as_deref(), request_host(&headers).as_deref()) else {
         return api_error(StatusCode::BAD_REQUEST, "cannot tell which address to stream to; set WEBRTC_HOST");
     };
@@ -837,6 +831,7 @@ async fn webrtc_websocket(
         key: me.owner().to_string(),
         vnc_socket: st.cfg.vnc_socket_of(me.owner()),
         audio_socket: st.cfg.audio_socket_of(me.owner()),
+        live: st.settings.of(me.owner()).subscribe(),
     };
     ws.on_upgrade(move |ws| crate::webrtc::signal(ws, hub, host, screen))
 }
@@ -1075,6 +1070,7 @@ async fn api_delete_user(
         }
     }
     st.spaces.sync_logged(&st.db).await;
+    st.settings.forget(&id);
     let jobs = st.db.delete_jobs_of(&id).await.unwrap_or_else(|e| {
         tracing::error!(error = %e, "removing a deleted user's transfers failed");
         Vec::new()

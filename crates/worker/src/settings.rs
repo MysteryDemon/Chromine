@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chromine_shared::fsutil;
@@ -9,6 +12,7 @@ use tokio::sync::{Mutex, watch};
 use crate::config::{Config, StreamMode, WebrtcCodec};
 
 const FILE: &str = "settings.json";
+const USER_DIR: &str = "user-settings";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,8 +88,14 @@ pub struct Store {
 
 impl Store {
     pub fn open(cfg: &Config) -> Store {
-        let defaults = Live::from_config(cfg);
-        let file = cfg.state_dir.join(FILE);
+        Store::open_at(
+            Live::from_config(cfg),
+            cfg.state_dir.join(FILE),
+            cfg.vnc_socket.with_file_name(chromine_shared::DISPLAY_SCALE_FILE),
+        )
+    }
+
+    fn open_at(defaults: Live, file: PathBuf, scale_file: PathBuf) -> Store {
         let live = match std::fs::read(&file) {
             Err(_) => defaults.clone(),
             Ok(bytes) => serde_json::from_slice::<Map<String, Value>>(&bytes)
@@ -96,13 +106,7 @@ impl Store {
                     defaults.clone()
                 }),
         };
-        let store = Store {
-            defaults,
-            file,
-            scale_file: cfg.vnc_socket.with_file_name(chromine_shared::DISPLAY_SCALE_FILE),
-            tx: watch::channel(live).0,
-            writing: Mutex::new(()),
-        };
+        let store = Store { defaults, file, scale_file, tx: watch::channel(live).0, writing: Mutex::new(()) };
         store.share_scale();
         store
     }
@@ -132,8 +136,9 @@ impl Store {
 
     fn save(&self, next: Live) -> Result<Live> {
         let dir = self.file.parent().context("settings directory")?;
+        let name = self.file.file_name().and_then(|n| n.to_str()).context("settings file name")?;
         let saved = serde_json::to_vec_pretty(&changes(&next, &self.defaults))?;
-        fsutil::atomic_write(dir, FILE, &saved, 0o600).context("cannot save settings")?;
+        fsutil::atomic_write(dir, name, &saved, 0o600).context("cannot save settings")?;
         let rescaled = next.display_scale != self.tx.borrow().display_scale;
         self.tx.send_replace(next.clone());
         if rescaled {
@@ -151,6 +156,60 @@ impl Store {
         if let Err(e) = fsutil::atomic_write(dir, name, scale.as_bytes(), 0o640) {
             tracing::warn!(error = %e, file = %self.scale_file.display(), "cannot pass the display scale to the browser");
         }
+    }
+}
+
+fn shared_dir(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        std::fs::DirBuilder::new().mode(0o2770).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))?;
+    }
+    Ok(())
+}
+
+pub struct Registry {
+    cfg: Arc<Config>,
+    admin: Arc<Store>,
+    users: std::sync::Mutex<HashMap<String, Arc<Store>>>,
+}
+
+impl Registry {
+    pub fn open(cfg: Arc<Config>) -> Registry {
+        let admin = Arc::new(Store::open(&cfg));
+        Registry { cfg, admin, users: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    fn user_file(&self, owner: &str) -> PathBuf {
+        self.cfg.state_dir.join(USER_DIR).join(format!("{owner}.json"))
+    }
+
+    pub fn of(&self, owner: &str) -> Arc<Store> {
+        if owner.is_empty() {
+            return self.admin.clone();
+        }
+        let mut users = self.users.lock().unwrap();
+        if let Some(store) = users.get(owner) {
+            return store.clone();
+        }
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(self.cfg.state_dir.join(USER_DIR));
+        let sockets = chromine_shared::user_dir(&self.cfg.vnc_root(), owner);
+        if let Some(parent) = sockets.parent()
+            && let Err(e) = shared_dir(parent).and_then(|_| shared_dir(&sockets))
+        {
+            tracing::warn!(user = %owner, error = %e, "cannot create a user's display folder");
+        }
+        let store = Arc::new(Store::open_at(
+            Live::from_config(&self.cfg),
+            self.user_file(owner),
+            sockets.join(chromine_shared::DISPLAY_SCALE_FILE),
+        ));
+        users.insert(owner.to_string(), store.clone());
+        store
+    }
+
+    pub fn forget(&self, owner: &str) {
+        self.users.lock().unwrap().remove(owner);
+        let _ = std::fs::remove_file(self.user_file(owner));
     }
 }
 
@@ -241,6 +300,31 @@ mod tests {
         ] {
             assert!(merge(&d, patch(bad.clone()), true).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn each_user_keeps_separate_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        let vnc = d.path().join("vnc");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&vnc).unwrap();
+        let cfg =
+            Config { state_dir: state.clone(), vnc_socket: vnc.join("vnc.sock"), ..crate::config::Config::for_tests() };
+        let reg = Registry::open(Arc::new(cfg));
+        let id = "0123456789abcdef0123456789abcdef";
+        reg.of(id).update(patch(json!({"display_scale": 2, "filecloud": false}))).await.unwrap();
+        assert_eq!(reg.of("").current().display_scale, 1.0);
+        assert!(reg.of("").current().filecloud);
+        assert_eq!(std::fs::read_to_string(vnc.join("users").join(id).join("display-scale")).unwrap(), "2");
+        assert!(
+            !vnc.join("display-scale").exists() || std::fs::read_to_string(vnc.join("display-scale")).unwrap() == "1"
+        );
+        let reopened = Registry::open(reg.cfg.clone());
+        assert_eq!(reopened.of(id).current().display_scale, 2.0);
+        assert!(!reopened.of(id).current().filecloud);
+        reopened.forget(id);
+        assert!(!state.join(USER_DIR).join(format!("{id}.json")).exists());
     }
 
     #[test]

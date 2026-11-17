@@ -347,6 +347,56 @@ impl Config {
     pub fn users_file(&self) -> PathBuf {
         self.vnc_root().join(chromine_shared::USERS_FILE)
     }
+    pub fn code_socket_of(&self, owner: &str) -> Option<PathBuf> {
+        let socket = self.code_socket.as_ref()?;
+        if owner.is_empty() {
+            return Some(socket.clone());
+        }
+        Some(chromine_shared::user_dir(socket.parent()?, owner).join("code.sock"))
+    }
+    pub fn code_links_dir_of(&self, owner: &str) -> PathBuf {
+        if owner.is_empty() {
+            return self.code_links_dir.clone();
+        }
+        chromine_shared::user_dir(&self.code_links_dir, owner)
+    }
+
+    #[cfg(test)]
+    pub fn for_tests() -> Config {
+        Config {
+            auth_user: "admin".into(),
+            auth_password: Secret::new("test password 1"),
+            public_url: None,
+            session_ttl: Duration::from_secs(3600),
+            download_dir: "/downloads".into(),
+            state_dir: "/state".into(),
+            delete_after_success: true,
+            min_free_disk_bytes: 0,
+            filecloud_base_url: Url::parse("https://filecloud24.cc").unwrap(),
+            upload_request_timeout: Duration::from_secs(60),
+            max_retry_attempts: 3,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            novnc_dir: "/usr/share/novnc".into(),
+            vnc_socket: "/vnc/vnc.sock".into(),
+            audio_socket: "/vnc/audio.sock".into(),
+            ui_dir: "/ui".into(),
+            display_scale: 1.0,
+            stream_mode: StreamMode::Vnc,
+            webrtc_port: 6758,
+            webrtc_host: None,
+            webrtc_codec: WebrtcCodec::Auto,
+            ffmpeg_bin: "/usr/bin/ffmpeg".into(),
+            code_socket: Some("/code-socket/code.sock".into()),
+            code_links_dir: "/code-links".into(),
+            code_listen: "127.0.0.1:0".parse().unwrap(),
+            code_port: 6759,
+            code_public_url: None,
+            https_host: None,
+            acme_directory: String::new(),
+            acme_listen: "127.0.0.1:0".parse().unwrap(),
+            dashboard_port: 6757,
+        }
+    }
     pub fn jobs_dir(&self) -> PathBuf {
         self.download_dir.join(chromine_shared::JOBS_SUBDIR)
     }
@@ -358,6 +408,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_user_has_their_own_code_paths() {
+        let cfg = Config::for_tests();
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(cfg.code_socket_of(""), Some(PathBuf::from("/code-socket/code.sock")));
+        assert_eq!(cfg.code_socket_of(id), Some(PathBuf::from(format!("/code-socket/users/{id}/code.sock"))));
+        assert_eq!(cfg.code_links_dir_of(""), PathBuf::from("/code-links"));
+        assert_eq!(cfg.code_links_dir_of(id), PathBuf::from(format!("/code-links/users/{id}")));
+        assert_eq!(cfg.vnc_socket_of(id), PathBuf::from(format!("/vnc/users/{id}/vnc.sock")));
+        assert_eq!(Config { code_socket: None, ..cfg }.code_socket_of(id), None);
+    }
 
     #[test]
     fn https_host_must_be_public() {

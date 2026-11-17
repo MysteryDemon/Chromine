@@ -709,16 +709,14 @@ impl Db {
         .await?)
     }
 
-    pub async fn user_ids(&self, now: i64) -> Result<(Vec<String>, Vec<String>)> {
-        let rows = sqlx::query_as::<_, (String, bool)>(
-            "SELECT u.id, EXISTS (SELECT 1 FROM sessions s WHERE s.owner = u.id AND s.expires_at > ?)
+    pub async fn user_ids(&self, now: i64) -> Result<Vec<(String, String, bool)>> {
+        Ok(sqlx::query_as::<_, (String, String, bool)>(
+            "SELECT u.id, u.username, EXISTS (SELECT 1 FROM sessions s WHERE s.owner = u.id AND s.expires_at > ?)
              FROM users u ORDER BY u.id",
         )
         .bind(now)
         .fetch_all(&self.pool)
-        .await?;
-        let active = rows.iter().filter(|r| r.1).map(|r| r.0.clone()).collect();
-        Ok((rows.into_iter().map(|r| r.0).collect(), active))
+        .await?)
     }
 
     pub async fn set_user_password(&self, id: &str, password_hash: &str) -> Result<bool> {

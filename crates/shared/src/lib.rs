@@ -22,6 +22,8 @@ pub struct UsersFile {
     pub schema: u32,
     pub known: Vec<String>,
     pub active: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub names: std::collections::BTreeMap<String, String>,
 }
 
 pub fn is_valid_user_id(id: &str) -> bool {

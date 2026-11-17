@@ -32,7 +32,7 @@ pub struct Uploader {
     pub db: Db,
     pub fc: FileCloud,
     pub max_attempts: u32,
-    pub settings: tokio::sync::watch::Receiver<crate::settings::Live>,
+    pub settings: std::sync::Arc<crate::settings::Registry>,
     pub wake: Arc<Notify>,
     pub cleanup_wake: Arc<Notify>,
     pub live: LiveSlot,
@@ -286,7 +286,7 @@ impl Uploader {
         let outcome: anyhow::Result<()> = async {
             match result {
                 Ok(link) => {
-                    let delete = !self.settings.borrow().keep_local;
+                    let delete = !self.settings.of(&job.owner).current().keep_local;
                     self.db.mark_uploaded(id, &link, delete, now).await?;
                     tracing::info!(job = %id, %link, "upload finalized; link saved");
                     self.cleanup_wake.notify_one();

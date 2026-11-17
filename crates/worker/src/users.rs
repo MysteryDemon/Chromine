@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::db::Db;
 use crate::ingest::Ingest;
+use crate::settings::Registry;
 
 pub const MIN_PASSWORD: usize = 8;
 const SHARED_DIR_MODE: u32 = 0o2770;
@@ -75,16 +76,18 @@ fn prepare_space(cfg: &Config, owner: &str) -> std::io::Result<()> {
 pub struct Spaces {
     cfg: Arc<Config>,
     template: Ingest,
+    settings: Arc<Registry>,
     stop: CancellationToken,
     running: Mutex<HashMap<String, (Ingest, CancellationToken)>>,
     writing: tokio::sync::Mutex<()>,
 }
 
 impl Spaces {
-    pub fn new(cfg: Arc<Config>, template: Ingest) -> Spaces {
+    pub fn new(cfg: Arc<Config>, template: Ingest, settings: Arc<Registry>) -> Spaces {
         Spaces {
             cfg,
             template,
+            settings,
             stop: CancellationToken::new(),
             running: Mutex::new(HashMap::new()),
             writing: tokio::sync::Mutex::new(()),
@@ -113,6 +116,7 @@ impl Spaces {
             owner: owner.to_string(),
             incoming: self.cfg.incoming_dir_of(owner),
             completed: self.cfg.completed_dir_of(owner),
+            settings: self.settings.of(owner).subscribe(),
             ..self.template.clone()
         };
         let token = self.stop.child_token();
@@ -129,14 +133,25 @@ impl Spaces {
 
     pub async fn sync(&self, db: &Db) -> Result<()> {
         let _w = self.writing.lock().await;
-        let (known, active) = db.user_ids(now_ms()).await?;
-        let file = UsersFile { schema: SCHEMA_VERSION, known: known.clone(), active };
+        let rows = db.user_ids(now_ms()).await?;
+        let known: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        let file = UsersFile {
+            schema: SCHEMA_VERSION,
+            known: known.clone(),
+            active: rows.iter().filter(|r| r.2).map(|r| r.0.clone()).collect(),
+            names: rows.iter().map(|r| (r.0.clone(), r.1.clone())).collect(),
+        };
         let bytes = serde_json::to_vec(&file)?;
-        let root = self.cfg.vnc_root();
-        tokio::task::spawn_blocking(move || fsutil::atomic_write(&root, USERS_FILE, &bytes, 0o640))
-            .await?
-            .context("cannot publish the user list for the browser")?;
+        let roots: Vec<_> = std::iter::once(self.cfg.vnc_root())
+            .chain(self.cfg.code_socket.as_ref().and_then(|s| s.parent()).map(Path::to_path_buf))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            roots.iter().try_for_each(|root| fsutil::atomic_write(root, USERS_FILE, &bytes, 0o640))
+        })
+        .await?
+        .context("cannot publish the user list for the browser")?;
         for id in &known {
+            self.settings.of(id);
             self.start(id);
         }
         let gone: Vec<(String, CancellationToken)> = {

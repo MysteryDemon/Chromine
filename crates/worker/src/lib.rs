@@ -94,14 +94,14 @@ impl App {
 
         let upload_wake = Arc::new(Notify::new());
         let cleanup_wake = Arc::new(Notify::new());
-        let settings = Arc::new(settings::Store::open(&cfg));
+        let settings = Arc::new(settings::Registry::open(cfg.clone()));
 
         let fc = FileCloud::new(cfg.filecloud_base_url.clone(), cfg.upload_request_timeout)?;
         let uploader = Uploader {
             db: db.clone(),
             fc,
             max_attempts: cfg.max_retry_attempts,
-            settings: settings.subscribe(),
+            settings: settings.clone(),
             wake: upload_wake.clone(),
             cleanup_wake: cleanup_wake.clone(),
             live: Default::default(),
@@ -115,7 +115,7 @@ impl App {
             completed: cfg.completed_dir(),
             jobs_dir: cfg.jobs_dir(),
             upload_wake: upload_wake.clone(),
-            settings: settings.subscribe(),
+            settings: settings.of("").subscribe(),
         };
         let cleanup = CleanupWorker {
             db: db.clone(),
@@ -137,7 +137,7 @@ impl App {
             audio_socket: cfg.audio_socket.clone(),
             ffmpeg: cfg.ffmpeg_bin.clone(),
             port: cfg.webrtc_port,
-            live: settings.subscribe(),
+            live: settings.of("").subscribe(),
         })
         .await
         {
@@ -151,10 +151,10 @@ impl App {
             ui,
             novnc,
             webrtc,
-            settings,
+            settings: settings.clone(),
             cfg: cfg.clone(),
             db: db.clone(),
-            spaces: users::Spaces::new(cfg.clone(), ingest.clone()),
+            spaces: users::Spaces::new(cfg.clone(), ingest.clone(), settings.clone()),
             uploader: uploader.clone(),
             password_hash: config::Secret::new(password_hash),
             upload_wake,

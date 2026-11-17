@@ -423,7 +423,7 @@ pub async fn run_instance(mut cfg: AgentConfig, sandbox: Sandbox, mut stop: watc
     let scale = watch_display_scale(&cfg, shutdown_rx.clone());
     let chrome_task = tokio::spawn(chrome_loop(cfg.clone(), shared.clone(), shutdown_rx.clone(), scale));
     let video_task = tokio::spawn(video::run_queue(cfg.clone(), shutdown_rx.clone()));
-    if !cfg.headless && cfg.user.is_none() {
+    if !cfg.headless {
         tokio::spawn(links::run(cfg.clone(), shared.clone(), shutdown_rx.clone()));
     }
 

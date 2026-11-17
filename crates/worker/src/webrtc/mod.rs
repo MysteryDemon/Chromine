@@ -45,6 +45,7 @@ pub struct Screen {
     pub key: String,
     pub vnc_socket: PathBuf,
     pub audio_socket: PathBuf,
+    pub live: watch::Receiver<Live>,
 }
 
 pub enum Feed {
@@ -80,12 +81,8 @@ impl Hub {
         let port = socket.local_addr()?.port();
         let (tx, rx) = mpsc::channel(64);
         let (feed_tx, feed_rx) = mpsc::channel(256);
-        let mut live = settings.live.clone();
-        let codec = live.borrow_and_update().webrtc_codec;
         let hub = State {
             settings: Arc::new(settings),
-            live,
-            codec,
             socket,
             outbox: Outbox::default(),
             sessions: Vec::new(),
@@ -129,8 +126,6 @@ struct Session {
 
 struct State {
     settings: Arc<Settings>,
-    live: watch::Receiver<Live>,
-    codec: WebrtcCodec,
     socket: UdpSocket,
     outbox: Outbox,
     sessions: Vec<Session>,
@@ -142,6 +137,8 @@ struct State {
 
 struct Display {
     settings: Arc<Settings>,
+    live: watch::Receiver<Live>,
+    codec: WebrtcCodec,
     feed: mpsc::Sender<Feed>,
     capture: Option<(mpsc::Sender<Command>, JoinHandle<()>)>,
     audio: Option<JoinHandle<()>>,
@@ -152,8 +149,14 @@ struct Display {
 
 impl Display {
     fn new(base: &Settings, screen: Screen, hub: &mpsc::Sender<(String, Feed)>) -> Display {
-        let settings =
-            Arc::new(Settings { vnc_socket: screen.vnc_socket, audio_socket: screen.audio_socket, ..base.clone() });
+        let mut live = screen.live;
+        let codec = live.borrow_and_update().webrtc_codec;
+        let settings = Arc::new(Settings {
+            vnc_socket: screen.vnc_socket,
+            audio_socket: screen.audio_socket,
+            live: live.clone(),
+            ..base.clone()
+        });
         let (feed, mut rx) = mpsc::channel::<Feed>(256);
         let out = hub.clone();
         let key = screen.key;
@@ -164,7 +167,17 @@ impl Display {
                 }
             }
         });
-        Display { settings, feed, capture: None, audio: None, codecs: BTreeSet::new(), audio_clock: None, cursor: None }
+        Display {
+            settings,
+            live,
+            codec,
+            feed,
+            capture: None,
+            audio: None,
+            codecs: BTreeSet::new(),
+            audio_clock: None,
+            cursor: None,
+        }
     }
 
     fn stop(&mut self) {
@@ -289,16 +302,6 @@ impl State {
                     }
                 }
                 _ = self.socket.writable(), if !self.outbox.queue.is_empty() => self.outbox.flush(&self.socket),
-                Ok(()) = self.live.changed() => {
-                    let codec = self.live.borrow_and_update().webrtc_codec;
-                    if codec != self.codec {
-                        self.codec = codec;
-                        tracing::info!(?codec, "WebRTC codec changed; viewers reconnect");
-                        for s in &mut self.sessions {
-                            s.rtc.disconnect();
-                        }
-                    }
-                }
                 _ = tokio::time::sleep_until(deadline.into()) => {
                     let now = Instant::now();
                     for s in &mut self.sessions {
@@ -315,14 +318,15 @@ impl State {
         if self.sessions.iter().filter(|s| s.screen == screen.key).count() >= MAX_VIEWERS {
             bail!("too many viewers are connected");
         }
-        let mut rtc = rtc_for(self.codec);
+        let key = screen.key.clone();
+        let display =
+            self.screens.entry(key.clone()).or_insert_with(|| Display::new(&self.settings, screen, &self.feed_tx));
+        let mut rtc = rtc_for(display.codec);
         rtc.add_local_candidate(Candidate::host(candidate, "udp").context("bad WebRTC address")?);
         let answer = rtc.sdp_api().accept_offer(offer).context("the browser offer was not usable")?;
         let id = self.next_id;
         self.next_id += 1;
         let (closed_tx, closed) = oneshot::channel();
-        let key = screen.key.clone();
-        self.screens.entry(key.clone()).or_insert_with(|| Display::new(&self.settings, screen, &self.feed_tx));
         self.sessions.push(Session {
             id,
             screen: key,
@@ -343,7 +347,9 @@ impl State {
         let mut soonest = Instant::now() + Duration::from_secs(1);
         let mut commands: Vec<(String, Command)> = Vec::new();
         for s in &mut self.sessions {
-            let cursor = self.screens.get(&s.screen).and_then(|d| d.cursor.as_deref());
+            let display = self.screens.get(&s.screen);
+            let cursor = display.and_then(|d| d.cursor.as_deref());
+            let codec = display.map_or(WebrtcCodec::Auto, |d| d.codec);
             let mut mine = Vec::new();
             loop {
                 if !s.rtc.is_alive() {
@@ -355,7 +361,7 @@ impl State {
                         break;
                     }
                     Ok(Output::Transmit(t)) => self.outbox.send(&self.socket, &t.contents, t.destination),
-                    Ok(Output::Event(e)) => s.event(e, self.codec, &mut mine, cursor),
+                    Ok(Output::Event(e)) => s.event(e, codec, &mut mine, cursor),
                     Err(e) => {
                         tracing::debug!(error = %e, "WebRTC viewer failed");
                         s.rtc.disconnect();
@@ -377,6 +383,18 @@ impl State {
         self.sessions.retain(|s| s.rtc.is_alive() && (s.connected || s.created.elapsed() < CONNECT_TIMEOUT));
         if self.sessions.len() != before {
             tracing::info!(viewers = self.sessions.len(), "WebRTC viewer left");
+        }
+        for (key, d) in &mut self.screens {
+            if d.live.has_changed().unwrap_or(false) {
+                let codec = d.live.borrow_and_update().webrtc_codec;
+                if codec != d.codec {
+                    d.codec = codec;
+                    tracing::info!(?codec, "WebRTC codec changed; viewers reconnect");
+                    for s in self.sessions.iter_mut().filter(|s| &s.screen == key) {
+                        s.rtc.disconnect();
+                    }
+                }
+            }
         }
         let sessions = &self.sessions;
         self.screens.retain(|key, d| {

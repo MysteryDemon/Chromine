@@ -44,4 +44,4 @@ if [ -s "$state/apt-packages" ]; then
   fi
 fi
 
-exec dumb-init /usr/bin/code-server "$@"
+exec dumb-init /bin/sh -c '/usr/bin/chromine-code-users & exec /usr/bin/code-server "$@"' chromine-code-start "$@"

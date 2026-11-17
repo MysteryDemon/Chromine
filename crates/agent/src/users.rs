@@ -163,7 +163,7 @@ mod tests {
                 std::fs::create_dir_all(root.join(id).join("inner")).unwrap();
             }
         }
-        let users = UsersFile { schema: 1, known: vec![keep.into()], active: vec![] };
+        let users = UsersFile { schema: 1, known: vec![keep.into()], active: vec![], ..Default::default() };
         collect_garbage(&base, &users, &HashMap::new());
         for root in &roots {
             assert!(root.join(keep).exists());

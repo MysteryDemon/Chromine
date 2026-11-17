@@ -38,7 +38,7 @@ pub fn router(st: Shared) -> Router {
 }
 
 async fn open_js(State(st): State<Shared>, jar: CookieJar) -> Response {
-    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
+    if authenticate(&st, &jar).await.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     (
@@ -64,9 +64,9 @@ pub fn web_link(raw: &str) -> Option<String> {
 }
 
 async fn open_link(State(st): State<Shared>, jar: CookieJar, headers: HeaderMap, body: Bytes) -> Response {
-    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
+    let Some(me) = authenticate(&st, &jar).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     if !same_origin(&st, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -75,7 +75,7 @@ async fn open_link(State(st): State<Shared>, jar: CookieJar, headers: HeaderMap,
     };
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let name = format!("{nanos}-w{:08x}.url", rand::random::<u32>());
-    match fsutil::atomic_write(&st.cfg.code_links_dir, &name, format!("{url}\n").as_bytes(), 0o660) {
+    match fsutil::atomic_write(&st.cfg.code_links_dir_of(me.owner()), &name, format!("{url}\n").as_bytes(), 0o660) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::warn!(error = %e, "cannot hand a VS Code link to the remote browser");
@@ -90,8 +90,12 @@ pub fn inject_opener(html: &[u8]) -> Vec<u8> {
 }
 
 fn page(status: StatusCode, title: &str, text: &str) -> Response {
+    page_with(status, title, text, "")
+}
+
+fn page_with(status: StatusCode, title: &str, text: &str, head: &str) -> Response {
     let html = format!(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{title}</title>\
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\">{head}<title>{title}</title>\
          <body style=\"margin:0;display:grid;place-items:center;height:100vh;background:#000;color:#aaa;font:15px system-ui\">\
          <p style=\"max-width:28rem;padding:0 16px;text-align:center\">{text}</p>"
     );
@@ -141,16 +145,19 @@ fn upstream_headers(from: &HeaderMap, upgrade: bool) -> HeaderMap {
 }
 
 async fn proxy(State(st): State<Shared>, jar: CookieJar, mut req: Request) -> Response {
-    let Some(socket) = st.cfg.code_socket.clone() else {
+    if st.cfg.code_socket.is_none() {
         return page(StatusCode::NOT_FOUND, "VS Code", "VS Code is not set up on this server.");
-    };
-    if !authenticate(&st, &jar).await.is_some_and(|a| a.is_admin()) {
+    }
+    let Some(me) = authenticate(&st, &jar).await else {
         return page(
             StatusCode::UNAUTHORIZED,
             "Sign in",
             "Sign in to the Chromine dashboard first, then reload this page.",
         );
-    }
+    };
+    let Some(socket) = st.cfg.code_socket_of(me.owner()) else {
+        return page(StatusCode::NOT_FOUND, "VS Code", "VS Code is not set up on this server.");
+    };
     let upgrade = is_upgrade(req.headers());
     if upgrade && !same_origin(&st, req.headers()) {
         return page(StatusCode::FORBIDDEN, "Refused", "Cross-site connection refused.");
@@ -158,12 +165,13 @@ async fn proxy(State(st): State<Shared>, jar: CookieJar, mut req: Request) -> Re
     match forward(&socket, &mut req, upgrade).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "VS Code is not answering");
-            page(
-                StatusCode::BAD_GATEWAY,
-                "VS Code is starting",
-                "VS Code is not running yet. If this lasts, start it with <code>docker compose up -d code</code>.",
-            )
+            tracing::warn!(error = %e, user = %me.owner(), "VS Code is not answering");
+            let text = if me.is_admin() {
+                "VS Code is not running yet. If this lasts, start it with <code>docker compose up -d code</code>."
+            } else {
+                "Your VS Code is starting. This page reloads by itself."
+            };
+            page_with(StatusCode::BAD_GATEWAY, "VS Code is starting", text, "<meta http-equiv=refresh content=3>")
         }
     }
 }

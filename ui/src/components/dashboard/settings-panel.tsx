@@ -565,8 +565,8 @@ function UserItem({
               <AlertDialogHeader>
                 <AlertDialogTitle>Delete {u.username}?</AlertDialogTitle>
                 <AlertDialogDescription className="text-white/55">
-                  They are signed out, and their Chrome profile, saved logins, downloads and transfer list are removed from
-                  this server. This can&apos;t be undone.
+                  They are signed out, and their Chrome profile, saved logins, VS Code files, downloads, transfer list and
+                  settings are removed from this server. This can&apos;t be undone.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -684,8 +684,8 @@ function UsersSection({ active, open }: { active: boolean; open: boolean }) {
         <div>
           <p className="text-sm font-medium text-white">New user</p>
           <p className="mt-1 text-xs leading-relaxed text-white/45">
-            Each user gets their own Chrome, downloads and transfers. It starts when they sign in and closes when they sign
-            out. Passwords need at least {minPassword} characters.
+            Each user gets their own Chrome, VS Code, downloads, transfers and settings. These start when they sign in and
+            close when they sign out. Passwords need at least {minPassword} characters.
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
@@ -733,7 +733,9 @@ function UsersSection({ active, open }: { active: boolean; open: boolean }) {
                 u.sessions > 0 ? `${u.username} was signed out.` : undefined,
               )
             }
-            onLogout={() => act(u, () => logoutUser(u.id), `Signed out ${u.username}`, "Their Chrome closes in a few seconds.")}
+            onLogout={() =>
+              act(u, () => logoutUser(u.id), `Signed out ${u.username}`, "Their Chrome and VS Code close in a few seconds.")
+            }
             onDelete={() => act(u, () => deleteUser(u.id), `Deleted ${u.username}`)}
           />
         ))
@@ -816,8 +818,8 @@ export const SettingsPanel = memo(function SettingsPanel({
   };
 
   useEffect(() => {
-    if (active && admin && !unsaved) load();
-  }, [active, admin]);
+    if (active && !unsaved) load();
+  }, [active]);
 
   useEffect(() => {
     if (!unsaved) return;
@@ -832,16 +834,6 @@ export const SettingsPanel = memo(function SettingsPanel({
       localStorage.setItem(OPEN_KEY, JSON.stringify(sections));
     } catch {}
   };
-
-  if (!admin) {
-    return (
-      <div className="mx-auto grid w-full max-w-3xl grid-cols-1 gap-4 px-3 pt-4 pb-24 sm:gap-5 sm:px-5 sm:pt-5">
-        <Accordion.Root type="multiple" value={open} onValueChange={remember} className="grid grid-cols-1 gap-3 sm:gap-4">
-          <SessionsSection active={active} open={open.includes("sessions")} />
-        </Accordion.Root>
-      </div>
-    );
-  }
 
   if (!data || !draft) {
     return (
@@ -1044,32 +1036,34 @@ export const SettingsPanel = memo(function SettingsPanel({
               options={QUALITIES}
             />
           </Row>
-          <Row
-            label="Server address"
-            hint="The IP your devices reach the server on. Leave empty to use the address in the browser bar. Applies to the next connection."
-            changed={changed("webrtc_host")}
-            unsaved={pending("webrtc_host")}
-          >
-            <form
-              className="w-full md:w-72"
-              onSubmit={(e) => {
-                e.preventDefault();
-                save();
-              }}
+          {admin ? (
+            <Row
+              label="Server address"
+              hint="The IP your devices reach the server on. Leave empty to use the address in the browser bar. Applies to the next connection."
+              changed={changed("webrtc_host")}
+              unsaved={pending("webrtc_host")}
             >
-              <input
-                value={v.webrtc_host}
-                onChange={(e) => set({ webrtc_host: e.target.value })}
-                placeholder="Automatic"
-                aria-label="Server address"
-                spellCheck={false}
-                autoCapitalize="off"
-                autoComplete="off"
-                enterKeyHint="done"
-                className="h-9 w-full min-w-0 rounded-full bg-white/[0.04] px-3.5 font-mono text-base text-white ring-1 ring-white/[0.08] outline-none placeholder:font-sans placeholder:text-white/30 focus:ring-white/30 sm:text-[13px]"
-              />
-            </form>
-          </Row>
+              <form
+                className="w-full md:w-72"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  save();
+                }}
+              >
+                <input
+                  value={v.webrtc_host}
+                  onChange={(e) => set({ webrtc_host: e.target.value })}
+                  placeholder="Automatic"
+                  aria-label="Server address"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoComplete="off"
+                  enterKeyHint="done"
+                  className="h-9 w-full min-w-0 rounded-full bg-white/[0.04] px-3.5 font-mono text-base text-white ring-1 ring-white/[0.08] outline-none placeholder:font-sans placeholder:text-white/30 focus:ring-white/30 sm:text-[13px]"
+                />
+              </form>
+            </Row>
+          ) : null}
         </Section>
 
         <Section
@@ -1096,7 +1090,7 @@ export const SettingsPanel = memo(function SettingsPanel({
             <Level label="Compression" value={v.vnc_compression} onCommit={(vnc_compression) => set({ vnc_compression })} />
           </Row>
         </Section>
-        <UsersSection active={active} open={open.includes("users")} />
+        {admin ? <UsersSection active={active} open={open.includes("users")} /> : null}
         <SessionsSection active={active} open={open.includes("sessions")} />
       </Accordion.Root>
 
